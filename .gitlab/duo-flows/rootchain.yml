@@ -1,0 +1,145 @@
+name: rootchain
+description: >
+  RootChain traces production Sentry errors to their SDLC origin using
+  four GitLab Orbit domains: source_code (symbols + files), code_review
+  (merge requests + blast radius via CALLS edges), security (active
+  vulnerabilities in blamed files), and ci (pipeline status per MR).
+  When Sentry creates a GitLab issue, this flow queries all four domains
+  in parallel, builds a confidence-ranked blame chain, surfaces any
+  co-located CVEs, and posts a structured Markdown comment with a
+  clickable Mermaid blame graph.
+version: 1
+
+trigger:
+  event: work_item_created
+
+filter:
+  labels:
+    any_of:
+      - sentry-alert
+      - Sentry
+  title_matches: '^\[Sentry\]|\[Error\]|TypeError|ValueError|NullPointerException|RuntimeError|ReferenceError|panic'
+
+context:
+  goal: |
+    A Sentry production error has been automatically filed as a GitLab issue.
+
+    Issue details:
+    - IID: {{ .WorkItem.IID }}
+    - Title: {{ .WorkItem.Title }}
+    - Project: {{ .WorkItem.Project.FullPath }}
+    - Web URL: {{ .WorkItem.WebURL }}
+    - Labels: {{ .WorkItem.Labels | join ", " }}
+
+    Full issue description (contains the Sentry stack trace):
+    ---
+    {{ .WorkItem.Description }}
+    ---
+
+    Your task:
+    1. First, call get_issue to check whether this issue already has the label
+       "rootchain-analyzed". If yes, stop immediately — do not add any comment.
+
+    2. Parse the Sentry error information from the issue description above.
+       Identify the error type, error message, and stack frames.
+       Filter out library frames (site-packages, node_modules, vendor, etc.).
+       Take the top 5 non-library frames closest to the error source.
+
+       If you find zero parseable frames, post the comment:
+       "RootChain: No parseable stack trace found in this issue." and add the
+       label "rootchain-analyzed", then stop.
+
+    3. For each surviving frame (up to 5), call query_graph with this Cypher query
+       (substitute the actual values for $function_name, $file_path, $group_path):
+
+       MATCH (d:Definition {name: $function_name})
+             -[:DEFINED_IN]->(f:File {path: $file_path})
+             <-[:MODIFIES_FILE]-(mr:MergeRequest)
+       WHERE mr.merged_at IS NOT NULL
+         AND mr.project_full_path STARTS WITH $group_path
+       RETURN mr.iid, mr.title, mr.description, mr.web_url,
+              mr.merged_at, mr.author_username
+       ORDER BY mr.merged_at DESC LIMIT 3
+
+       Run all frames in parallel if the platform supports it.
+
+       If the primary query returns 0 results, fall back to the file-level query:
+       MATCH (f:File {path: $file_path})
+             <-[:MODIFIES_FILE]-(mr:MergeRequest)
+       WHERE mr.merged_at IS NOT NULL
+         AND mr.project_full_path STARTS WITH $group_path
+       RETURN mr.iid, mr.title, mr.description, mr.web_url,
+              mr.merged_at, mr.author_username
+       ORDER BY mr.merged_at DESC LIMIT 3
+
+       If still 0 results: mark that frame as "orbit_miss" (no Orbit data).
+
+    4. For each MR found, get its linked work items:
+       MATCH (mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
+             -[:CLOSES|MENTIONED_IN]->(wi:WorkItem)
+       RETURN wi.iid, wi.title, wi.state, wi.web_url
+
+       And get its reviewers:
+       MATCH (u:User)-[:REVIEWED]->(mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
+       RETURN u.username
+
+    4b. For each frame, run two additional queries IN PARALLEL (alongside the
+        caller count):
+
+        Blast radius (source_code domain):
+        MATCH (caller:Definition)-[:CALLS]->(d:Definition {name: $function_name})
+        RETURN count(caller) AS caller_count
+        If this returns 0 or errors, use caller_count = 0.
+
+        Security findings (security domain):
+        MATCH (f:File {path: $file_path})<-[:AFFECTS_FILE]-(v:Vulnerability)
+        WHERE v.state IN ["detected", "confirmed"]
+        RETURN v.name, v.severity, v.state, v.report_type, v.web_url
+        ORDER BY CASE v.severity WHEN "critical" THEN 1 WHEN "high" THEN 2
+                 WHEN "medium" THEN 3 ELSE 4 END LIMIT 3
+        If no results: no security section in the output. Do not fabricate.
+
+        Pipeline status (ci domain) — run per MR found:
+        MATCH (mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
+              -[:HAS_PIPELINE]->(p:Pipeline)
+        RETURN p.status, p.web_url, p.created_at
+        ORDER BY p.created_at DESC LIMIT 1
+        Map status to badge: passed=✅, failed=❌, running=🔄, pending=⏳, null=omit.
+
+    5. Score each frame using this formula:
+       - days_since = days since mr.merged_at
+       - recency = 1.0 / (1 + days_since / 30)
+       - depth = 1.0 / frame_depth   (frame 1 = closest to error = depth 1)
+         NOTE: frame 1 = FIRST listed non-library frame in the Sentry issue (not reversed)
+       - blast = min(caller_count / 10.0, 1.0)   (use 0 if caller_count unavailable)
+       - confidence = recency * 0.5 + depth * 0.35 + blast * 0.15
+       - If fallback (file-level) was used: multiply confidence * 0.7
+       - If orbit_miss: confidence = 0.0
+
+       Labels: >= 0.7 = HIGH (🔴), 0.4–0.69 = MEDIUM (🟡), < 0.4 = LOW (🟢)
+
+       If two frames point to the same MR iid: keep only the higher-confidence entry.
+
+    6. The primary_suspect is the entry with the highest confidence score >= 0.4.
+       If none meet the threshold, note it in the comment.
+
+    7. Build the Markdown comment following the exact format in your SKILL.md.
+       Call create_note with this comment as the body.
+
+    8. Call add_label with the label "rootchain-analyzed".
+
+steps:
+  - name: parse_and_trace
+    type: agent
+    description: >
+      Parse the Sentry stack trace, query Orbit for each frame's SDLC history,
+      build a confidence-ranked blame chain, and post the analysis comment.
+    skills:
+      - rootchain
+    tools:
+      - query_graph
+      - create_note
+      - add_label
+      - get_issue
+    max_iterations: 30
+    timeout_seconds: 180
