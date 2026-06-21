@@ -405,3 +405,106 @@ def test_security_section_absent_when_no_findings(config, sample_event, sample_h
     comment = format_blame_comment(chain, sample_event, config, "myorg/myapp")
 
     assert "### ⚠️ Security Context" not in comment
+
+
+# ---------------------------------------------------------------------------
+# _error_type_hint
+# ---------------------------------------------------------------------------
+
+
+def test_error_type_hint_null(config, sample_frame, sample_history):
+    """NullPointerException triggers the null/nil hint."""
+    from src.rootchain.models import SentryEvent
+    event = SentryEvent(
+        error_type="NullPointerException",
+        error_message="null",
+        culprit=None, environment=None,
+        frames=[sample_frame], sentry_issue_url=None,
+    )
+    chain = build_blame_chain(event, [sample_history], config)
+    comment = format_blame_comment(chain, event, config, "myorg/myapp")
+    assert "nil/null dereference" in comment
+
+
+def test_error_type_hint_index(config, sample_frame, sample_history):
+    """IndexError triggers boundary condition hint."""
+    from src.rootchain.models import SentryEvent
+    event = SentryEvent(
+        error_type="IndexError",
+        error_message="list index out of range",
+        culprit=None, environment=None,
+        frames=[sample_frame], sentry_issue_url=None,
+    )
+    chain = build_blame_chain(event, [sample_history], config)
+    comment = format_blame_comment(chain, event, config, "myorg/myapp")
+    assert "boundary condition" in comment
+
+
+def test_error_type_hint_timeout(config, sample_frame, sample_history):
+    """TimeoutError triggers I/O hot-path hint."""
+    from src.rootchain.models import SentryEvent
+    event = SentryEvent(
+        error_type="TimeoutError",
+        error_message="timed out",
+        culprit=None, environment=None,
+        frames=[sample_frame], sentry_issue_url=None,
+    )
+    chain = build_blame_chain(event, [sample_history], config)
+    comment = format_blame_comment(chain, event, config, "myorg/myapp")
+    assert "timeout budget" in comment
+
+
+def test_error_type_hint_permission(config, sample_frame, sample_history):
+    """PermissionError triggers auth guard hint."""
+    from src.rootchain.models import SentryEvent
+    event = SentryEvent(
+        error_type="PermissionError",
+        error_message="access denied",
+        culprit=None, environment=None,
+        frames=[sample_frame], sentry_issue_url=None,
+    )
+    chain = build_blame_chain(event, [sample_history], config)
+    comment = format_blame_comment(chain, event, config, "myorg/myapp")
+    assert "auth guard" in comment
+
+
+def test_error_type_hint_memory(config, sample_frame, sample_history):
+    """OOMError triggers allocation hint."""
+    from src.rootchain.models import SentryEvent
+    event = SentryEvent(
+        error_type="OOMError",
+        error_message="out of memory",
+        culprit=None, environment=None,
+        frames=[sample_frame], sentry_issue_url=None,
+    )
+    chain = build_blame_chain(event, [sample_history], config)
+    comment = format_blame_comment(chain, event, config, "myorg/myapp")
+    assert "allocation" in comment
+
+
+def test_error_type_hint_panic(config, sample_frame, sample_history):
+    """panic triggers unsafe blocks hint."""
+    from src.rootchain.models import SentryEvent
+    event = SentryEvent(
+        error_type="panic",
+        error_message="segfault",
+        culprit=None, environment=None,
+        frames=[sample_frame], sentry_issue_url=None,
+    )
+    chain = build_blame_chain(event, [sample_history], config)
+    comment = format_blame_comment(chain, event, config, "myorg/myapp")
+    assert "unsafe block" in comment
+
+
+def test_error_type_hint_generic(config, sample_frame, sample_history):
+    """Unknown error type uses generic fallback hint."""
+    from src.rootchain.models import SentryEvent
+    event = SentryEvent(
+        error_type="CustomBusinessError",
+        error_message="something weird",
+        culprit=None, environment=None,
+        frames=[sample_frame], sentry_issue_url=None,
+    )
+    chain = build_blame_chain(event, [sample_history], config)
+    comment = format_blame_comment(chain, event, config, "myorg/myapp")
+    assert "CustomBusinessError" in comment
