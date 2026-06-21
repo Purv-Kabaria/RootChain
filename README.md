@@ -8,6 +8,8 @@
 [![Orbit](https://img.shields.io/badge/GitLab-Orbit-blue)](https://docs.gitlab.com/orbit/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 
+**Live demo:** [GitLab Issue #1 — RootChain analyzing its own Orbit query bug](https://gitlab.com/Purv-Kabaria-group/rootchain/-/issues/1)
+
 ---
 
 ## The Problem
@@ -192,55 +194,83 @@ The agent parses the GitLab issue description to extract a `SentryEvent` structu
 
 #### 3. Orbit Graph Traversal
 
-For each surviving frame, the agent executes a multi-hop Orbit query via the `query_graph` MCP tool (or the REST API at `POST /api/v4/orbit/query`).
+For each surviving frame, `OrbitClient` (and the Duo Agent Platform flow via `query_graph`)
+queries Orbit using the **JSON DSL** at `POST /api/v4/orbit/query`. Orbit does **not** accept
+Cypher strings — all queries are JSON objects with `query_type`, `node`, `neighbors`, and
+`limit` fields.
 
-**Primary query — Find MRs that modified this symbol:**
-```cypher
-MATCH (d:Definition {name: $function_name})
-      -[:DEFINED_IN]->(f:File {path: $file_path})
-      <-[:MODIFIES_FILE]-(mr:MergeRequest)
-WHERE mr.merged_at IS NOT NULL
-  AND mr.project_full_path STARTS WITH $group_path
-RETURN
-  mr.iid          AS iid,
-  mr.title        AS title,
-  mr.description  AS description,
-  mr.web_url      AS url,
-  mr.merged_at    AS merged_at,
-  mr.author_username AS author
-ORDER BY mr.merged_at DESC
-LIMIT 3
+**Multi-strategy MR discovery — cascade, stop at first hit:**
+
+**Strategy 1 — File neighbors** (direct; when Orbit has File→MR edges indexed):
+```json
+{
+  "query": {
+    "query_type": "neighbors",
+    "node": {"id": "n", "entity": "File", "filters": {"path": "<file_path>"}},
+    "neighbors": {"node": "n"}
+  }
+}
+```
+Filter response for `type == "MergeRequest"` nodes where `merged_at` is present
+or `state == "merged"`.
+
+**Strategy 2 — MergeRequestDiffFile neighbors** (one hop via diff record):
+```json
+{
+  "query": {
+    "query_type": "neighbors",
+    "node": {"id": "n", "entity": "MergeRequestDiffFile", "filters": {"new_path": "<file_path>"}},
+    "neighbors": {"node": "n"}
+  }
+}
 ```
 
-**Secondary query — Get work items linked to each MR:**
-```cypher
-MATCH (mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
-      -[:CLOSES|MENTIONED_IN]->(wi:WorkItem)
-RETURN
-  wi.iid    AS iid,
-  wi.title  AS title,
-  wi.state  AS state,
-  wi.web_url AS url
-```
+**Strategy 3 — old_path fallback** (renamed files; sets `fallback_used=True`, confidence ×0.7):
+Same JSON as Strategy 2 but `"old_path"` instead of `"new_path"`.
 
-**Tertiary query — Get reviewers (for @mention):**
-```cypher
-MATCH (u:User)-[:REVIEWED]->(mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
-RETURN u.username AS username, u.name AS name
+**Strategy 4 — GitLab commits REST API** (reliable fallback when Orbit graph edges aren't yet indexed):
 ```
+GET /api/v4/projects/{project_path}/repository/commits?path={file_path}&ref_name=main
+→ for each commit SHA:
+GET /api/v4/projects/{project_path}/repository/commits/{sha}/merge_requests
+→ collect merged MR iids → enrich each via Orbit traversal(MergeRequest, {iid: N})
+```
+REST API fields (`merged_at`, `web_url`, `author`) supplement any Orbit MR node
+fields that are absent. This strategy reliably bridges the gap while the Orbit
+graph is still building its edge index for recently-merged files.
 
-**Hot-path check (for confidence scoring):**
-```cypher
-MATCH (caller:Definition)-[:CALLS]->(d:Definition {name: $function_name})
-RETURN count(caller) AS caller_count
+If all strategies return 0 MRs: mark frame as `orbit_miss`.
+
+**MR enrichment — one query per found MR** (returns WorkItems, Users, Pipelines together):
+```json
+{
+  "query": {
+    "query_type": "neighbors",
+    "node": {"id": "n", "entity": "MergeRequest", "filters": {"iid": <mr_iid>}},
+    "neighbors": {"node": "n"}
+  }
+}
 ```
+Filter by `type`: `"WorkItem"` → linked issues · `"User"` → reviewers · `"Pipeline"` → CI status.
+
+**Blast radius** (caller count, used in confidence formula):
+```json
+{
+  "query": {
+    "query_type": "neighbors",
+    "node": {"id": "n", "entity": "Definition", "filters": {"name": "<function_name>"}},
+    "neighbors": {"node": "n"}
+  }
+}
+```
+Count neighbor nodes of `type == "Definition"` with a different `name` value.
 
 **Query execution strategy:**
-- Run primary query for all 5 frames in parallel (not sequential)
-- Cache results keyed by `(function_name, file_path)` within a single flow run
-- If primary query returns 0 results: fall back to file-level MR lookup (remove `Definition` node, query only on `File`)
-- If file-level also returns 0: mark frame as `orbit_miss` (function too new, file not indexed, or external)
-- Timeout per query: 30 seconds. Retry: 3× with 2s, 4s, 8s backoff.
+- Run all frame queries in parallel via `asyncio.gather()`, not sequentially
+- Cache results by `(function_name, file_path)` within a single run
+- Timeout per query: 30 seconds. Retry: 3× with 2s, 4s, 8s backoff (tenacity).
+- On HTTP 400 (unsupported filter field): return empty list, do not retry.
+- On HTTP 429: respect `Retry-After` header before retrying.
 
 #### 4. Blame Chain Construction
 
@@ -383,34 +413,45 @@ class BlameChain(BaseModel):
 
 #### 7. Orbit API Response Handling
 
-The Orbit REST API returns a graph result object. Normalize it before use:
+The Orbit REST API returns a graph result object. The actual response shape (verified against
+the live GitLab.com Orbit API):
 
-```python
-# Raw Orbit response shape
+```json
 {
-  "data": {
+  "result": {
     "nodes": [
-      {"id": "mr:1234", "type": "MergeRequest", "properties": {...}},
-      ...
+      {
+        "id": "mr:1",
+        "type": "MergeRequest",
+        "iid": 1,
+        "title": "Add retry logic",
+        "state": "merged",
+        "merged_at": "2024-01-11T14:23:00Z",
+        "author_username": "alice"
+      },
+      {
+        "id": "wi:2",
+        "type": "WorkItem",
+        "iid": 2,
+        "title": "Orbit client sends wrong query format",
+        "state": "opened"
+      }
     ],
-    "edges": [
-      {"source": "mr:1234", "target": "wi:89", "type": "CLOSES"},
-      ...
-    ]
-  },
-  "meta": {
-    "query_time_ms": 142,
-    "node_count": 7,
-    "edge_count": 4
+    "edges": []
   }
 }
 ```
 
-Always validate:
-- `data` key exists (Orbit returns `{"error": ...}` on malformed queries)
-- Node `type` matches expected before accessing `properties`
-- `merged_at` is parseable as ISO 8601 before constructing `datetime`
-- `iid` is numeric (can come as string from ClickHouse)
+**Critical normalisation rules:**
+- Top-level key is `"result"`, **not** `"data"`. Access: `body["result"]["nodes"]`.
+- Node properties are **flat** on the node object — there is **no** `"properties"` sub-dict.
+- If `"result"` is absent or `"error"` key is present at the top level: treat as `orbit_miss`.
+- `merged_at` and `web_url` may be absent on `MergeRequest` nodes from traversal queries.
+  If `web_url` is missing: construct `{gitlab_url}/{project_path}/-/merge_requests/{iid}`.
+  If `merged_at` is missing but `state == "merged"`: use the REST commits API to get `merged_at`.
+- `iid` can be returned as a string from ClickHouse — always cast to `int`.
+- HTTP 400 means an unsupported filter field was used (Orbit has an allowlist). Return `[]`,
+  do not retry. HTTP 5xx and network errors are retried up to 3× with exponential backoff.
 
 #### 8. GitLab Issue Update
 
@@ -710,18 +751,15 @@ description: >
 version: 1
 
 trigger:
-  event: work_item_created
+  events:
+    - work_item_created
 
 filter:
-  # Only activate for issues with the sentry-alert label
-  # (set by Sentry's native GitLab integration or the webhook receiver)
   labels:
     any_of:
       - sentry-alert
       - Sentry
-  # Additional guard: title must look like a Sentry error
-  # This prevents accidental triggers on manually created issues
-  title_matches: '^\[Sentry\]|\[Error\]|TypeError|ValueError|NullPointerException'
+  title_matches: '^\[Sentry\]|\[Error\]|TypeError|ValueError|NullPointerException|RuntimeError|ReferenceError|panic'
 
 context:
   goal: |
@@ -742,19 +780,21 @@ context:
     Your task:
     1. Check if this issue already has the label "rootchain-analyzed". If yes, stop immediately.
     2. Parse the Sentry error information from the issue description above.
-    3. Extract up to {{ env "ROOTCHAIN_MAX_FRAMES" | default "5" }} non-library stack frames.
-    4. For each frame, use the Orbit knowledge graph to find recent MRs that modified
-       the function, the work items those MRs were linked to, and the authors/reviewers.
+    3. Extract up to 5 non-library stack frames.
+    4. For each frame, use the Orbit JSON DSL (via query_graph) to find recent MRs
+       that modified the file, the work items those MRs were linked to, and the CI status.
     5. Build a confidence-ranked blame chain.
     6. Post a structured analysis comment on the issue.
     7. Add the label "rootchain-analyzed" to the issue.
+
+    See SKILL.md for the exact JSON DSL query shapes and response format.
 
 steps:
   - name: parse_and_trace
     type: agent
     description: >
-      Parse the Sentry event and query Orbit for each stack frame.
-      Construct a blame chain ranked by confidence.
+      Parse the Sentry stack trace, query Orbit for each frame's SDLC history,
+      build a confidence-ranked blame chain, and post the analysis comment.
     skills:
       - rootchain
     tools:
@@ -762,8 +802,8 @@ steps:
       - create_note          # Add comment to a GitLab issue
       - add_label            # Add label to a GitLab issue
       - get_issue            # Read the current issue state
-    max_iterations: 20       # Prevent infinite loops
-    timeout_seconds: 120     # 2 minute hard limit
+    max_iterations: 30       # 5 frames × ~4 queries each + formatting overhead
+    timeout_seconds: 180     # 3 minute hard limit
 ```
 
 ### Key Flow Design Decisions
@@ -777,8 +817,8 @@ Labels are set programmatically by Sentry and are reliable. Title patterns are a
 **Why the idempotency guard?**  
 Sentry sometimes re-fires the same alert if an issue is reopened. The label check ensures the flow runs exactly once per issue, regardless of Sentry's behavior.
 
-**Why `max_iterations: 20`?**  
-Each Orbit query is one iteration. 5 frames × 3 queries each (primary, linked issues, reviewers) = 15 queries plus parsing and formatting = ~18 total. 20 gives a small buffer.
+**Why `max_iterations: 30`?**  
+Each `query_graph` call is one iteration. Per frame: up to 4 queries (File neighbors, MergeRequestDiffFile neighbors, MR enrichment, Vulnerability traversal) × 5 frames = 20 queries, plus blast-radius neighbors per frame = ~25 total. 30 gives a comfortable buffer for retries and the enrichment calls.
 
 ---
 
@@ -802,15 +842,26 @@ All Orbit queries go to:
 POST https://gitlab.com/api/v4/orbit/query
 Content-Type: application/json
 PRIVATE-TOKEN: {token}
+```
 
+Orbit uses a **JSON DSL** — **not** Cypher strings. The request body is always a JSON
+object with a `"query"` key containing `query_type`, `node`, and optional `neighbors`/`limit`:
+
+```json
 {
-  "query": "MATCH (d:Definition ...) RETURN ...",
-  "parameters": { ... },
-  "timeout": 30000
+  "query": {
+    "query_type": "traversal",
+    "node": {"id": "n", "entity": "File", "filters": {"path": "src/my/file.py"}},
+    "limit": 5
+  }
 }
 ```
 
-The query language is Cypher-like (based on GitLab's internal graph DSL). Always use parameterized queries — never string-concatenate user input into queries.
+Supported `query_type` values: `"traversal"`, `"neighbors"`, `"aggregation"`, `"path_finding"`.
+
+**Never** string-interpolate user-supplied values into the JSON payload — always pass them
+as typed values in the `"filters"` object. This prevents injection and avoids 400 errors
+from Orbit's strict filter-key allowlist.
 
 ### Orbit Schema Reference
 
@@ -852,7 +903,9 @@ curl -s \
 
 ### All Orbit Queries Used by RootChain
 
-See `docs/orbit_queries.md` for the complete annotated query library. The four core queries are summarized in the LLD section above.
+All query shapes are documented inline in the LLD section above and in `src/rootchain/orbit_client.py`.
+The five strategies in `_find_mrs_for_file()` cover the full cascade from direct File neighbors
+to the commits REST API fallback.
 
 ---
 
