@@ -444,3 +444,68 @@ def test_language_auto_detection_fallback(config):
     assert event is not None
     assert len(event.frames) >= 1
     assert event.frames[0].function_name == "execute_job"
+
+
+# ---------------------------------------------------------------------------
+# Kotlin stack traces
+# ---------------------------------------------------------------------------
+
+
+def test_parse_kotlin_basic(config):
+    description = (
+        "## NullPointerException: Payment gateway returned null\n\n"
+        "### Stacktrace\n\n"
+        "at com.myorg.payments.Processor.processPayment(Processor.kt:142)\n"
+        "at com.myorg.payments.Gateway.call(Gateway.kt:88)\n"
+        "at kotlin.coroutines.jvm.internal.BaseContinuationImpl.resumeWith(ContinuationImpl.kt:33)\n"
+    )
+    parser = SentryParser(config)
+    event = parser.parse("[Sentry] NullPointerException: gateway null", description)
+
+    assert event is not None
+    assert event.error_type == "NullPointerException"
+    # Non-library frames: processPayment and call (kotlin. prefix filtered)
+    assert len(event.frames) == 2
+    assert event.frames[0].language.value == "kotlin"
+    assert event.frames[0].function_name == "com.myorg.payments.Processor.processPayment"
+    assert event.frames[0].frame_depth == 1
+
+
+def test_detect_kotlin(config):
+    description = "at com.example.App.run(App.kt:10)\n"
+    assert _detect_language(description) == Language.KOTLIN
+
+
+# ---------------------------------------------------------------------------
+# Rust stack traces
+# ---------------------------------------------------------------------------
+
+
+def test_parse_rust_basic(config):
+    description = (
+        "thread 'main' panicked at 'index out of bounds: the len is 3 but the index is 5',"
+        " src/payments/processor.rs:142\n\n"
+        "stack backtrace:\n"
+        "   0: rust_begin_unwind\n"
+        "             at /rustc/abc123/library/std/src/panicking.rs:617:5\n"
+        "   1: myapp::payments::process_payment\n"
+        "             at src/payments/processor.rs:142:8\n"
+        "   2: myapp::main\n"
+        "             at src/main.rs:10:5\n"
+    )
+    parser = SentryParser(config)
+    event = parser.parse("[Sentry] panic: index out of bounds", description)
+
+    assert event is not None
+    assert event.error_type == "panic"
+    assert "index out of bounds" in event.error_message
+    # rust_begin_unwind at /rustc/... is library (std:: prefix path)
+    # process_payment and main both app code but "main" is in SKIP_FUNCTION_NAMES
+    non_lib = [f for f in event.frames if not f.is_library]
+    assert any("process_payment" in f.function_name for f in non_lib)
+    assert event.frames[0].language == Language.RUST
+
+
+def test_detect_rust(config):
+    description = "   1: myapp::payments::process_payment\n             at src/payments/processor.rs:142:8\n"
+    assert _detect_language(description) == Language.RUST

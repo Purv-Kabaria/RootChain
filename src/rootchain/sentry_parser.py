@@ -54,6 +54,14 @@ LIBRARY_PREFIXES = (
     "org/junit/",
     "kotlin.",
     "kotlin/",
+    # Rust standard library
+    "std::",
+    "core::",
+    "alloc::",
+    "tokio::",
+    "hyper::",
+    "actix_",
+    "futures_",
     # Generic
     "vendor/",
     "/opt/homebrew/",
@@ -110,6 +118,19 @@ _JAVA_CAUSED_BY = re.compile(
 )
 _JAVA_ERROR = re.compile(r"^(?P<type>[\w.]+(?:Exception|Error)):\s*(?P<msg>.+)$")
 
+# Kotlin: same JVM format as Java, identified by .kt file extension
+_KOTLIN_FILE = re.compile(r"\([\w.]+\.kt:\d+\)")
+
+# Rust: two-line frames from RUST_BACKTRACE=full or panic output
+_RUST_FUNC_FRAME = re.compile(r"^\s*\d+:\s+(?P<func>[\w::<>,\s\[\]&*+]+?)(?:\s+at\s+|$)")
+_RUST_FILE_FRAME = re.compile(r"^\s+at\s+(?P<path>[^:\s]+\.rs):(?P<line>\d+)")
+_RUST_PANIC = re.compile(
+    r"^thread '.*?' panicked at '(?P<msg>[^']+)',\s*(?P<path>[^:]+\.rs):(?P<line>\d+)"
+)
+_RUST_PANIC_NEW = re.compile(
+    r"^thread '.*?' panicked at (?P<path>[^:\n]+\.rs):(?P<line>\d+):\d+\n(?P<msg>.+)"
+)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
@@ -127,12 +148,16 @@ def _detect_language(description: str) -> Language:
         return Language.PYTHON
     if _NODE_FRAME.search(description):
         return Language.JAVASCRIPT
+    if _KOTLIN_FILE.search(description) and _JAVA_FRAME.search(description):
+        return Language.KOTLIN
     if _JAVA_FRAME.search(description):
         return Language.JAVA
     if _RUBY_FRAME.search(description) and ":in `" in description:
         return Language.RUBY
     if _GO_GOROUTINE.search(description) or re.search(r"\.go:\d+", description):
         return Language.GO
+    if re.search(r"\.rs:\d+", description) or _RUST_PANIC.search(description):
+        return Language.RUST
     return Language.UNKNOWN
 
 
@@ -316,6 +341,71 @@ def _parse_java(
     return error_type, error_message, culprit, frames, raw_count
 
 
+def _parse_kotlin(
+    description: str, config: Config
+) -> tuple[str, str, str | None, list[StackFrame], int]:
+    """Kotlin JVM traces share Java format — re-tag frames with Language.KOTLIN."""
+    error_type, error_message, culprit, java_frames, raw_count = _parse_java(
+        description, config
+    )
+    frames = [
+        StackFrame(
+            file_path=f.file_path,
+            function_name=f.function_name,
+            line_number=f.line_number,
+            language=Language.KOTLIN,
+            is_library=f.is_library,
+            frame_depth=f.frame_depth,
+            raw_line=f.raw_line,
+        )
+        for f in java_frames
+    ]
+    return error_type, error_message, culprit, frames, raw_count
+
+
+def _parse_rust(
+    description: str, config: Config
+) -> tuple[str, str, str | None, list[StackFrame], int]:
+    error_type = "panic"
+    error_message = ""
+    culprit: str | None = None
+
+    # Extract panic message (two formats: old and Rust 1.73+)
+    m = _RUST_PANIC.search(description)
+    if m:
+        error_message = m.group("msg")
+    else:
+        m2 = _RUST_PANIC_NEW.search(description)
+        if m2:
+            error_message = m2.group("msg").strip()
+
+    # Parse two-line frames: "N: func_name\n   at path/file.rs:line"
+    lines = description.splitlines()
+    raw_frames: list[tuple[str, int, str]] = []
+    i = 0
+    while i < len(lines):
+        func_m = _RUST_FUNC_FRAME.match(lines[i])
+        if func_m:
+            func = func_m.group("func").strip()
+            if i + 1 < len(lines):
+                file_m = _RUST_FILE_FRAME.match(lines[i + 1])
+                if file_m:
+                    raw_frames.append(
+                        (file_m.group("path"), int(file_m.group("line")), func)
+                    )
+                    i += 2
+                    continue
+        i += 1
+
+    raw_count = len(raw_frames)
+
+    if raw_frames:
+        culprit = f"{raw_frames[0][0]}:{raw_frames[0][1]}"
+
+    frames = _build_frames(raw_frames, Language.RUST, config)
+    return error_type, error_message, culprit, frames, raw_count
+
+
 def _build_frames(
     raw: list[tuple[str, int, str]], language: Language, config: Config
 ) -> list[StackFrame]:
@@ -359,6 +449,8 @@ _PARSE_FNS = {
     Language.GO: _parse_go,
     Language.RUBY: _parse_ruby,
     Language.JAVA: _parse_java,
+    Language.KOTLIN: _parse_kotlin,
+    Language.RUST: _parse_rust,
 }
 
 
@@ -465,6 +557,8 @@ class SentryParser:
                 "python": len(_PY_FRAME.findall(issue_description)),
                 "node": len(_NODE_FRAME.findall(issue_description)),
                 "java": len(_JAVA_FRAME.findall(issue_description)),
+                "kotlin": sum(1 for m in _JAVA_FRAME.finditer(issue_description) if _KOTLIN_FILE.search(m.group(0))),
                 "ruby": len(_RUBY_FRAME.findall(issue_description)),
+                "rust": len(_RUST_FILE_FRAME.findall(issue_description)),
             },
         }

@@ -47,6 +47,8 @@ class Language(str, Enum):
     GO = "go"
     RUBY = "ruby"
     JAVA = "java"
+    KOTLIN = "kotlin"
+    RUST = "rust"
     UNKNOWN = "unknown"
 
 
