@@ -276,11 +276,55 @@ def _build_analysis(chain: BlameChain, event: SentryEvent) -> str:
     suggestion = (
         f"**Suggested investigation:** Review `{frame.file_path}` around line {frame.line_number}, "
         f"specifically changes introduced in [MR !{mr.iid}]({mr.web_url}). "
-        f"Check whether the `{frame.function_name}` function handles all return paths correctly "
-        f"for the `{event.error_type}` scenario."
+        f"{_error_type_hint(event.error_type, frame.function_name)}"
     )
 
     return f"{intent}{suggestion}"
+
+
+def _error_type_hint(error_type: str, function_name: str) -> str:
+    """Return a short, error-type-specific investigation hint."""
+    et = error_type.lower()
+    fn = f"`{function_name}`"
+    if any(k in et for k in ("null", "none", "nilpointer", "npe")):
+        return (
+            f"Look for unguarded nil/null dereferences in {fn}: a dependency "
+            "may now return null where the MR assumed it never would."
+        )
+    if any(k in et for k in ("type", "classcast", "attributeerror")):
+        return (
+            f"Check argument types passed to {fn}: the MR may have changed a "
+            "return type or removed a field that callers still expect."
+        )
+    if any(k in et for k in ("index", "bounds", "keyerror", "nosuchelement")):
+        return (
+            f"Check boundary conditions in {fn}: the MR may have changed "
+            "collection sizes, map keys, or off-by-one assumptions."
+        )
+    if any(k in et for k in ("timeout", "deadline", "context")):
+        return (
+            f"Look for new I/O calls or locks added to {fn} in this MR that "
+            "extend the hot path and push past downstream timeout budgets."
+        )
+    if any(k in et for k in ("permission", "auth", "forbidden", "unauthorized")):
+        return (
+            f"Check whether the MR changed auth guards or middleware order around {fn}: "
+            "a missing decorator or wrong scope may have been introduced."
+        )
+    if any(k in et for k in ("memory", "oom", "outofmemory", "stackoverflow")):
+        return (
+            f"Profile allocation in {fn}: the MR may have introduced an unbounded "
+            "accumulation, a large buffered response, or unintentional recursion."
+        )
+    if any(k in et for k in ("panic", "segfault", "sigsegv", "signal")):
+        return (
+            f"Examine unsafe blocks or raw pointer arithmetic added to {fn} in this MR. "
+            "Check for use-after-free or data races if concurrency changed."
+        )
+    return (
+        f"Check whether the `{error_type}` scenario was tested for {fn} "
+        "before this MR was merged — the change may have introduced an unhandled path."
+    )
 
 
 def format_no_stack_trace_comment(event_title: str) -> str:
@@ -291,7 +335,7 @@ def format_no_stack_trace_comment(event_title: str) -> str:
         "No parseable stack trace found in this issue description. "
         "Possible reasons:\n"
         "- The issue was created without a stack trace\n"
-        "- The stack trace format is not supported (supported: Python, Node.js, Go, Ruby, Java)\n"
+        "- The stack trace format is not supported (supported: Python, Node.js, Go, Ruby, Java, Kotlin, Rust)\n"
         "- If this is a minified JavaScript error: enable Sentry source maps\n\n"
         "_No SDLC analysis was performed._"
     )
