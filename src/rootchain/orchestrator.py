@@ -64,9 +64,14 @@ async def run_analysis(
     issue_description: str,
     issue_labels: list[str],
     config: Config,
+    dry_run: bool = False,
 ) -> None:
-    """Run the full RootChain analysis pipeline for a single GitLab issue."""
-    bound_log = log.bind(project_path=project_path, issue_iid=issue_iid)
+    """Run the full RootChain analysis pipeline for a single GitLab issue.
+
+    dry_run=True parses, queries Orbit, builds the comment, but does NOT
+    post to GitLab. The rendered comment is written to stdout instead.
+    """
+    bound_log = log.bind(project_path=project_path, issue_iid=issue_iid, dry_run=dry_run)
 
     # Idempotency guard
     if config.add_label in issue_labels:
@@ -84,6 +89,7 @@ async def run_analysis(
                 gitlab=gitlab,
                 orbit=orbit,
                 bound_log=bound_log,
+                dry_run=dry_run,
             )
 
 
@@ -97,6 +103,7 @@ async def _analyze(
     gitlab: GitLabClient,
     orbit: OrbitClient,
     bound_log,  # type: ignore[type-arg]
+    dry_run: bool = False,
 ) -> None:
     parser = SentryParser(config)
     event = parser.parse(issue_title, issue_description)
@@ -104,6 +111,9 @@ async def _analyze(
     if event is None:
         bound_log.warning("no_parseable_stack_trace")
         comment = format_no_stack_trace_comment(issue_title)
+        if dry_run:
+            print(comment)
+            return
         await _post_and_label(gitlab, project_path, issue_iid, comment, config, bound_log)
         return
 
@@ -112,6 +122,9 @@ async def _analyze(
         bound_log.warning("all_frames_filtered")
         raw_count = issue_description.count("File \"")
         comment = format_all_library_frames_comment(raw_count)
+        if dry_run:
+            print(comment)
+            return
         await _post_and_label(gitlab, project_path, issue_iid, comment, config, bound_log)
         return
 
@@ -122,6 +135,11 @@ async def _analyze(
     chain = build_blame_chain(event, histories, config)
 
     comment = format_blame_comment(chain, event, config, project_path)
+
+    if dry_run:
+        print(comment)
+        bound_log.info("dry_run_complete", frames_analyzed=chain.frames_analyzed)
+        return
 
     await _post_and_label(gitlab, project_path, issue_iid, comment, config, bound_log)
 
@@ -164,6 +182,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="RootChain — trace Sentry errors to SDLC origin")
     parser.add_argument("--project-path", required=True)
     parser.add_argument("--issue-iid", type=int, required=True)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Parse and query Orbit but print the comment to stdout instead of posting it",
+    )
     args = parser.parse_args()
 
     config = Config.from_env()
@@ -191,6 +214,7 @@ def main() -> None:
             issue_description=issue.get("description", ""),
             issue_labels=issue.get("labels", []),
             config=config,
+            dry_run=args.dry_run,
         )
 
     asyncio.run(_fetch_and_run())
