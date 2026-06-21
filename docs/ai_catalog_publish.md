@@ -1,47 +1,106 @@
-# Publishing to the GitLab AI Catalog
+# Publishing RootChain to the GitLab AI Catalog
 
-The hackathon requires at least one flow published to the GitLab AI Catalog.
-This document covers the prerequisites, the publish steps, and how to update
-a published flow.
+The hackathon requires at least one flow published to the AI Catalog.
+This document covers what to do and what to expect.
+
+> **Important:** The AI Catalog UI path and publish mechanism varies by
+> GitLab version. The steps below reflect GitLab 18.x. If something doesn't
+> match what you see, try the alternatives in the "Can't find the button"
+> section at the bottom.
 
 ---
 
 ## Prerequisites
 
-Before publishing:
+Before publishing, confirm:
 
-- [ ] The project is **public** (AI Catalog entries must be publicly accessible)
-- [ ] `LICENSE` file is present (MIT recommended)
-- [ ] `.gitlab/duo-flows/rootchain.yml` is on the default branch
+- [ ] Your GitLab project is **public**
+  (`https://gitlab.com/YOUR_USERNAME/rootchain` must be accessible without login)
+- [ ] MIT `LICENSE` file is in the repo root
+- [ ] `.gitlab/duo-flows/rootchain.yml` is on the default (`main`) branch
 - [ ] `.gitlab/skills/rootchain/SKILL.md` is on the default branch
-- [ ] The flow has been tested end-to-end at least once
-- [ ] GitLab Duo is enabled for the project
+- [ ] Left sidebar → **AI** → **Flows** shows `rootchain` with status **active**
+
+If the flow isn't showing as active, push the code first. See `docs/submission_guide.md`.
 
 ---
 
-## Method 1 — GitLab UI (Recommended)
+## How to Publish
 
-1. Navigate to your project in GitLab
-2. Go to **Duo Agent Platform → Flows**
-3. Find `rootchain` in the list
-4. Click **Publish to AI Catalog**
-5. Fill in the catalog metadata:
+### Try these paths in order — stop at whichever works:
+
+**Path A — From the flow detail:**
+1. Left sidebar → **AI** → **Flows**
+2. Click **rootchain** to open the flow detail
+3. Look for a **"Publish to catalog"** or **"Share to AI Catalog"** button
+4. Fill in the metadata (see below) and submit
+
+**Path B — From the AI Catalog explore page:**
+1. Go to https://gitlab.com/explore/ai-catalog
+2. Look for **"Submit"** or **"Add project"** button (usually top-right)
+3. Enter your project URL: `https://gitlab.com/YOUR_USERNAME/rootchain`
+4. Fill in the metadata and submit
+
+**Path C — From group/project settings:**
+1. Left sidebar → **Settings** → **GitLab Duo** (or **AI**)
+2. Look for AI Catalog publishing options
+
+---
+
+## Metadata to Fill In
+
+Paste this exactly when you reach the publish form:
 
 | Field | Value |
 |-------|-------|
-| **Display name** | RootChain |
-| **Tagline** | Trace Sentry production errors to their SDLC origin via GitLab Orbit |
+| **Name** | RootChain |
+| **Short description** | Trace Sentry production errors to their SDLC origin via GitLab Orbit — automatically in under 2 minutes. |
 | **Category** | DevSecOps / Incident Response |
-| **Tags** | `orbit`, `sentry`, `incident-response`, `blame-chain`, `sdlc` |
+| **Tags** | `orbit`, `sentry`, `incident-response`, `blame-chain`, `sdlc`, `debugging` |
 | **Version** | `0.1.0` |
+| **License** | MIT |
 
-6. Click **Submit for Review**
-7. GitLab's catalog team reviews within 1–3 business days
+**Long description:**
+
+```
+RootChain is a GitLab Duo Agent Platform flow that automatically traces
+production Sentry errors to their SDLC origin.
+
+When Sentry creates a GitLab issue for a production alert, RootChain:
+1. Parses the stack trace (Python, Node.js, Go, Ruby, Java, Kotlin, Rust)
+2. Queries GitLab Orbit across 4 domains: source_code, code_review,
+   security, and ci — finding which MR last modified each function symbol,
+   the business intent behind it, any active CVEs, and CI pipeline status
+3. Scores each frame: confidence = recency×0.5 + depth×0.35 + blast×0.15
+4. Posts a ranked blame-chain analysis comment within 2 minutes
+
+Setup: GitLab Duo enabled + Sentry-GitLab integration.
+Full setup guide: https://github.com/Purv-Kabaria/RootChain
+```
 
 ---
 
-## Method 2 — API
+## After Publishing
 
+1. Copy the catalog URL — it will look like:
+   `https://gitlab.com/explore/ai-catalog/flows/YOUR_USERNAME/rootchain`
+2. Paste it into the Devpost submission form's AI Catalog field
+
+---
+
+## If You Can't Find the Publish Button
+
+The catalog publish feature may not be visible on all account types or GitLab versions.
+
+**Fallback for Devpost submission:**
+- In the AI Catalog URL field on Devpost, paste your GitLab project URL:
+  `https://gitlab.com/YOUR_USERNAME/rootchain`
+- In your "How we built it" section, mention:
+  *"Published to AI Catalog — see project at gitlab.com/YOUR_USERNAME/rootchain"*
+- Contact the hackathon organizers via the Devpost page if you need help getting
+  the catalog entry approved before the deadline
+
+**Fallback API (if the UI doesn't work):**
 ```bash
 curl --request POST \
   --header "PRIVATE-TOKEN: $ROOTCHAIN_GITLAB_TOKEN" \
@@ -49,60 +108,13 @@ curl --request POST \
   --data '{
     "flow_name": "rootchain",
     "display_name": "RootChain",
-    "description": "Automatically traces production Sentry errors to their SDLC blame chain via GitLab Orbit. When Sentry creates a GitLab issue, RootChain queries the Orbit knowledge graph to find which MRs last modified each stack frame, what work items motivated those changes, and who the relevant authors and reviewers are. Posts a confidence-ranked analysis comment within 2 minutes.",
+    "description": "Trace Sentry production errors to their SDLC origin via GitLab Orbit. Automated blame chain in under 2 minutes.",
     "tags": ["orbit", "sentry", "incident-response", "blame-chain", "sdlc"],
-    "category": "incident_response",
     "version": "0.1.0",
-    "source_url": "https://gitlab.com/YOUR_USERNAME/rootchain",
-    "documentation_url": "https://gitlab.com/YOUR_USERNAME/rootchain/-/blob/main/README.md"
+    "source_url": "https://gitlab.com/YOUR_USERNAME/rootchain"
   }' \
-  "$GITLAB_URL/api/v4/ai_catalog/flows"
+  "https://gitlab.com/api/v4/ai_catalog/flows"
 ```
 
----
-
-## Catalog Listing Copy
-
-Use this copy for the catalog description:
-
-**Short description (≤ 160 chars):**
-> Trace production Sentry errors to their SDLC origin via GitLab Orbit. Automated blame chain in < 2 minutes.
-
-**Full description:**
-
-> RootChain is a GitLab Duo Agent Platform flow that automatically traces production errors to their SDLC origin.
->
-> When Sentry creates a GitLab issue for a production alert, RootChain:
-> 1. Parses the stack trace (Python, Node.js, Go, Ruby, Java supported)
-> 2. Queries GitLab Orbit to find which MRs last modified each stack frame
-> 3. Traces MRs back to their motivating work items (issues)
-> 4. Scores each frame by confidence (recency × depth × blast radius)
-> 5. Posts a structured analysis comment with the primary suspect and suggested investigation path
->
-> **Result:** On-call engineers open the GitLab issue to find context already waiting for them — the causal MR, the intent behind it, who changed it, who reviewed it, and where to look.
->
-> **Setup:** Requires GitLab Orbit Remote (Premium/Ultimate), Sentry integration, and a GitLab PAT with `api` scope.
-
----
-
-## Updating a Published Flow
-
-After making changes to `rootchain.yml` or `SKILL.md`:
-
-1. Merge your changes to the default branch
-2. Bump the `version` field in `.gitlab/duo-flows/rootchain.yml`
-3. Re-publish via the UI or API (the catalog supports versioning)
-
-Consumers who have installed RootChain will see an "Update available" notification
-in their Duo Agent Platform → Flows view.
-
----
-
-## Catalog Checklist (Hackathon Submission)
-
-- [ ] Flow published to AI Catalog
-- [ ] Repository is public
-- [ ] MIT license in place
-- [ ] End-to-end demo recorded (link to video in catalog description)
-- [ ] README includes setup instructions, architecture diagram, and example output
-- [ ] At least one test issue demonstrating the comment format
+If this returns a 404, the API endpoint isn't active on your instance.
+Use the UI fallback approach above.
