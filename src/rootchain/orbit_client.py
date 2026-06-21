@@ -1,6 +1,8 @@
 """Orbit REST API client — async, with retries, caching, and fallback queries.
 
-Never string-interpolates user input into Cypher. Always uses parameterized queries.
+Uses the Orbit JSON DSL (POST /api/v4/orbit/query) with query_type values:
+traversal, neighbors, aggregation, path_finding.
+Never string-interpolates user input into queries.
 """
 
 from __future__ import annotations
@@ -8,12 +10,10 @@ from __future__ import annotations
 import asyncio
 import time
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 import httpx
 import structlog
 from tenacity import (
-    RetryError,
     retry,
     retry_if_exception_type,
     stop_after_attempt,
@@ -26,93 +26,6 @@ from .models import (
 )
 
 log = structlog.get_logger()
-
-# ---------------------------------------------------------------------------
-# Query templates (parameterized — never interpolated)
-# ---------------------------------------------------------------------------
-
-_PRIMARY_QUERY = """
-MATCH (d:Definition {name: $function_name})
-      -[:DEFINED_IN]->(f:File {path: $file_path})
-      <-[:MODIFIES_FILE]-(mr:MergeRequest)
-WHERE mr.merged_at IS NOT NULL
-  AND mr.project_full_path STARTS WITH $group_path
-RETURN
-  mr.iid          AS iid,
-  mr.title        AS title,
-  mr.description  AS description,
-  mr.web_url      AS url,
-  mr.merged_at    AS merged_at,
-  mr.author_username AS author
-ORDER BY mr.merged_at DESC
-LIMIT 3
-"""
-
-_FALLBACK_QUERY = """
-MATCH (f:File {path: $file_path})
-      <-[:MODIFIES_FILE]-(mr:MergeRequest)
-WHERE mr.merged_at IS NOT NULL
-  AND mr.project_full_path STARTS WITH $group_path
-RETURN
-  mr.iid          AS iid,
-  mr.title        AS title,
-  mr.description  AS description,
-  mr.web_url      AS url,
-  mr.merged_at    AS merged_at,
-  mr.author_username AS author
-ORDER BY mr.merged_at DESC
-LIMIT 3
-"""
-
-_LINKED_ISSUES_QUERY = """
-MATCH (mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
-      -[:CLOSES|MENTIONED_IN]->(wi:WorkItem)
-RETURN
-  wi.iid    AS iid,
-  wi.title  AS title,
-  wi.state  AS state,
-  wi.web_url AS url
-"""
-
-_REVIEWERS_QUERY = """
-MATCH (u:User)-[:REVIEWED]->(mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
-RETURN u.username AS username
-"""
-
-_CALLER_COUNT_QUERY = """
-MATCH (caller:Definition)-[:CALLS]->(d:Definition {name: $function_name})
-RETURN count(caller) AS caller_count
-"""
-
-_SECURITY_QUERY = """
-MATCH (f:File {path: $file_path})<-[:AFFECTS_FILE]-(v:Vulnerability)
-WHERE v.state IN ["detected", "confirmed"]
-RETURN
-  v.name        AS name,
-  v.severity    AS severity,
-  v.state       AS state,
-  v.report_type AS report_type,
-  v.web_url     AS web_url
-ORDER BY
-  CASE v.severity
-    WHEN "critical" THEN 1
-    WHEN "high"     THEN 2
-    WHEN "medium"   THEN 3
-    ELSE 4
-  END
-LIMIT 3
-"""
-
-_PIPELINE_STATUS_QUERY = """
-MATCH (mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
-      -[:HAS_PIPELINE]->(p:Pipeline)
-RETURN
-  p.status   AS status,
-  p.web_url  AS web_url,
-  p.created_at AS created_at
-ORDER BY p.created_at DESC
-LIMIT 1
-"""
 
 
 # ---------------------------------------------------------------------------
@@ -135,13 +48,79 @@ def _days_since(dt: datetime | None) -> int:
     return (datetime.now(timezone.utc) - dt).days
 
 
+def _node_str(node: dict, *keys: str, default: str = "") -> str:
+    """Extract first matching key from a flat Orbit response node."""
+    for key in keys:
+        val = node.get(key)
+        if val is not None:
+            return str(val)
+    return default
+
+
+def _filter_merged_mrs(nodes: list[dict]) -> list[dict]:
+    """Extract merged MergeRequest nodes from a flat node list, sorted by merge date desc."""
+    mrs = [n for n in nodes if n.get("type") == "MergeRequest" and n.get("merged_at")]
+    return sorted(mrs, key=lambda n: n.get("merged_at", ""), reverse=True)
+
+
+def _dedup_mrs(mrs: list[dict]) -> list[dict]:
+    """Deduplicate by iid, preserving order (highest-confidence first)."""
+    seen: set[int] = set()
+    result: list[dict] = []
+    for mr in mrs:
+        iid = int(mr.get("iid", 0))
+        if iid and iid not in seen:
+            seen.add(iid)
+            result.append(mr)
+    return result
+
+
+def _extract_mr_enrichment(
+    neighbors: list[dict],
+) -> tuple[list[LinkedIssue], list[str], str | None]:
+    """Parse WorkItem, User, and Pipeline nodes from a MergeRequest neighbors response."""
+    linked: list[LinkedIssue] = []
+    reviewers: list[str] = []
+    pipeline_status: str | None = None
+    latest_pipeline_time = ""
+
+    for node in neighbors:
+        node_type = node.get("type")
+
+        if node_type == "WorkItem":
+            try:
+                iid = int(node.get("iid", 0))
+            except (ValueError, TypeError):
+                continue
+            if iid > 0:
+                linked.append(LinkedIssue(
+                    iid=iid,
+                    title=_node_str(node, "title"),
+                    web_url=_node_str(node, "web_url", "url"),
+                    state=_node_str(node, "state", default="unknown"),
+                ))
+
+        elif node_type == "User":
+            username = node.get("username", "")
+            if username:
+                reviewers.append(str(username))
+
+        elif node_type == "Pipeline":
+            created_at = node.get("created_at", "")
+            if node.get("status") and created_at >= latest_pipeline_time:
+                latest_pipeline_time = created_at
+                pipeline_status = str(node.get("status"))
+
+    return linked, reviewers, pipeline_status
+
+
 # ---------------------------------------------------------------------------
 # OrbitClient
 # ---------------------------------------------------------------------------
 
 
 class OrbitClient:
-    """Async client for GitLab Orbit graph queries."""
+    """Async client for GitLab Orbit graph queries (JSON DSL)."""
 
     def __init__(self, config: Config) -> None:
         self._config = config
@@ -154,7 +133,6 @@ class OrbitClient:
             timeout=httpx.Timeout(config.orbit_timeout_seconds),
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
-        # In-process cache: key = (function_name, file_path) → SymbolHistory
         self._cache: dict[tuple[str, str], SymbolHistory] = {}
 
     async def close(self) -> None:
@@ -173,7 +151,7 @@ class OrbitClient:
     async def get_symbol_histories(
         self, frames: list[StackFrame]
     ) -> list[SymbolHistory]:
-        """Query Orbit for all frames in parallel. Never raises — returns orbit_miss on failure."""
+        """Query Orbit for all frames in parallel. Never raises — orbit_miss on failure."""
         tasks = [self._get_symbol_history_cached(f) for f in frames]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -208,46 +186,24 @@ class OrbitClient:
     async def _get_symbol_history(self, frame: StackFrame) -> SymbolHistory:
         log_ = log.bind(function_name=frame.function_name, file_path=frame.file_path)
 
-        # 1. Primary query: Definition → File → MergeRequest
-        mr_nodes = await self._run_query(
-            _PRIMARY_QUERY,
-            {
-                "function_name": frame.function_name,
-                "file_path": frame.file_path,
-                "group_path": self._config.group_path,
-            },
-        )
-
-        fallback_used = False
-        if not mr_nodes:
-            log_.info("orbit_primary_miss_trying_fallback")
-            mr_nodes = await self._run_query(
-                _FALLBACK_QUERY,
-                {
-                    "file_path": frame.file_path,
-                    "group_path": self._config.group_path,
-                },
-            )
-            fallback_used = True
+        mr_nodes, fallback_used = await self._find_mrs_for_file(frame.file_path)
 
         if not mr_nodes:
             log_.info("orbit_miss")
             return self._orbit_miss(frame)
 
-        # 2. Caller count + security findings — run in parallel
         caller_count, security_findings = await asyncio.gather(
             self._get_caller_count(frame.function_name),
             self._get_security_findings(frame.file_path),
         )
 
-        # 3. Enrich each MR with linked issues + reviewers + pipeline status
-        recent_mrs = await asyncio.gather(
-            *[self._enrich_mr(node) for node in mr_nodes[:3]],
+        recent_mrs_raw = await asyncio.gather(
+            *[self._enrich_mr(node) for node in mr_nodes],
             return_exceptions=True,
         )
 
         enriched: list[MRContext] = []
-        for item in recent_mrs:
+        for item in recent_mrs_raw:
             if isinstance(item, Exception):
                 log_.warning("mr_enrichment_failed", exc=str(item))
             else:
@@ -270,139 +226,126 @@ class OrbitClient:
             security_findings=security_findings,
         )
 
-    async def _enrich_mr(self, mr_node: dict) -> MRContext:  # type: ignore[type-arg]
-        props = mr_node.get("properties", {})
-        mr_iid = int(props.get("iid", 0))
-        merged_at = _parse_merged_at(props.get("merged_at"))
+    async def _find_mrs_for_file(self, file_path: str) -> tuple[list[dict], bool]:
+        """Multi-strategy MR discovery for a file. Returns (mr_nodes, fallback_used)."""
+        # Strategy 1: Direct neighbors of File node (if Orbit has File→MR edges)
+        nodes = await self._get_neighbors("File", {"path": file_path})
+        mrs = _filter_merged_mrs(nodes)
+        if mrs:
+            log.debug("orbit_file_direct_hit", file_path=file_path, count=len(mrs))
+            return mrs[:3], False
 
-        # Linked work items + reviewers + pipeline status — all in parallel
-        linked, reviewers, pipeline_status = await asyncio.gather(
-            self._get_linked_issues(mr_iid),
-            self._get_reviewers(mr_iid),
-            self._get_pipeline_status(mr_iid),
-        )
+        # Strategy 2: Neighbors of MergeRequestDiffFile (one hop via diff record)
+        nodes = await self._get_neighbors("MergeRequestDiffFile", {"new_path": file_path})
+        mrs = _filter_merged_mrs(nodes)
+        if mrs:
+            log.debug("orbit_diff_file_direct_hit", file_path=file_path, count=len(mrs))
+            return mrs[:3], False
+
+        # Strategy 3: MergeRequestDiff intermediate hop
+        mr_diffs = [n for n in nodes if n.get("type") == "MergeRequestDiff"]
+        if mr_diffs:
+            all_mrs: list[dict] = []
+            for diff in mr_diffs[:3]:
+                diff_id = diff.get("id", "")
+                if not diff_id:
+                    continue
+                diff_nodes = await self._get_neighbors("MergeRequestDiff", {"id": diff_id})
+                all_mrs.extend(_filter_merged_mrs(diff_nodes))
+            if all_mrs:
+                log.debug("orbit_diff_two_hop_hit", file_path=file_path)
+                return _dedup_mrs(all_mrs)[:3], False
+
+        # Strategy 4: old_path fallback (renamed files)
+        nodes = await self._get_neighbors("MergeRequestDiffFile", {"old_path": file_path})
+        mrs = _filter_merged_mrs(nodes)
+        if mrs:
+            log.debug("orbit_old_path_hit", file_path=file_path, count=len(mrs))
+            return mrs[:3], True  # fallback_used = True (renamed file path)
+
+        log.info("orbit_no_mr_data", file_path=file_path)
+        return [], True
+
+    async def _enrich_mr(self, mr_node: dict) -> MRContext:
+        """Build MRContext from a flat Orbit MergeRequest node (single enrichment query)."""
+        mr_iid = int(mr_node.get("iid", 0))
+        merged_at = _parse_merged_at(mr_node.get("merged_at"))
+
+        # One neighbors query returns WorkItem, User, and Pipeline nodes together
+        neighbors = await self._get_neighbors("MergeRequest", {"iid": mr_iid})
+        linked, reviewers, pipeline_status = _extract_mr_enrichment(neighbors)
 
         return MRContext(
             iid=mr_iid,
-            title=str(props.get("title", "")),
-            description=str(props.get("description", "")),
-            author_username=str(props.get("author", props.get("author_username", ""))),
+            title=_node_str(mr_node, "title"),
+            description=_node_str(mr_node, "description"),
+            author_username=_node_str(mr_node, "author_username", "author", default="unknown"),
             merged_at=merged_at,
-            web_url=str(props.get("url", props.get("web_url", ""))),
+            web_url=_node_str(mr_node, "web_url", "url"),
             linked_issues=linked,
             reviewers=reviewers,
             days_since_merge=_days_since(merged_at),
             pipeline_status=pipeline_status,
         )
 
-    async def _get_linked_issues(self, mr_iid: int) -> list[LinkedIssue]:
-        try:
-            nodes = await self._run_query(
-                _LINKED_ISSUES_QUERY,
-                {
-                    "mr_iid": mr_iid,
-                    "project_path": self._config.project_path,
-                },
-            )
-            issues = []
-            for node in nodes:
-                if node.get("type") not in ("WorkItem", None):
-                    continue
-                p = node.get("properties", {})
-                iid_raw = p.get("iid", 0)
-                try:
-                    iid = int(iid_raw)
-                except (ValueError, TypeError):
-                    continue
-                if iid == 0:
-                    continue
-                issues.append(
-                    LinkedIssue(
-                        iid=iid,
-                        title=str(p.get("title", "")),
-                        web_url=str(p.get("url", p.get("web_url", ""))),
-                        state=str(p.get("state", "unknown")),
-                    )
-                )
-            return issues
-        except Exception as exc:
-            log.warning("linked_issues_query_failed", mr_iid=mr_iid, exc=str(exc))
-            return []
-
-    async def _get_reviewers(self, mr_iid: int) -> list[str]:
-        try:
-            nodes = await self._run_query(
-                _REVIEWERS_QUERY,
-                {
-                    "mr_iid": mr_iid,
-                    "project_path": self._config.project_path,
-                },
-            )
-            return [
-                str(n.get("properties", {}).get("username", ""))
-                for n in nodes
-                if n.get("type") in ("User", None)
-                and n.get("properties", {}).get("username")
-            ]
-        except Exception as exc:
-            log.warning("reviewers_query_failed", mr_iid=mr_iid, exc=str(exc))
-            return []
-
     async def _get_caller_count(self, function_name: str) -> int:
         try:
-            nodes = await self._run_query(
-                _CALLER_COUNT_QUERY,
-                {"function_name": function_name},
+            nodes = await self._get_neighbors("Definition", {"name": function_name})
+            return sum(
+                1 for n in nodes
+                if n.get("type") == "Definition" and n.get("name") != function_name
             )
-            if nodes:
-                raw = nodes[0].get("properties", {}).get("caller_count", 0)
-                try:
-                    return int(raw)
-                except (ValueError, TypeError):
-                    return 0
-            return 0
         except Exception as exc:
             log.warning("caller_count_query_failed", function_name=function_name, exc=str(exc))
             return 0
 
     async def _get_security_findings(self, file_path: str) -> list[VulnerabilityFinding]:
         try:
-            nodes = await self._run_query(_SECURITY_QUERY, {"file_path": file_path})
-            findings = []
+            nodes = await self._traverse("Vulnerability", {"file_path": file_path}, limit=3)
+            findings: list[VulnerabilityFinding] = []
             for node in nodes:
-                p = node.get("properties", {})
-                findings.append(
-                    VulnerabilityFinding(
-                        name=str(p.get("name", "")),
-                        severity=str(p.get("severity", "unknown")).lower(),
-                        state=str(p.get("state", "detected")),
-                        report_type=str(p.get("report_type", "unknown")),
-                        web_url=str(p.get("web_url", "")),
-                    )
-                )
+                state = _node_str(node, "state", default="detected")
+                if state not in ("detected", "confirmed"):
+                    continue
+                findings.append(VulnerabilityFinding(
+                    name=_node_str(node, "name"),
+                    severity=_node_str(node, "severity", default="unknown").lower(),
+                    state=state,
+                    report_type=_node_str(node, "report_type", default="unknown"),
+                    web_url=_node_str(node, "web_url", "url"),
+                ))
             return findings
         except Exception as exc:
             log.warning("security_query_failed", file_path=file_path, exc=str(exc))
             return []
 
-    async def _get_pipeline_status(self, mr_iid: int) -> str | None:
-        try:
-            nodes = await self._run_query(
-                _PIPELINE_STATUS_QUERY,
-                {"mr_iid": mr_iid, "project_path": self._config.project_path},
-            )
-            if nodes:
-                return str(nodes[0].get("properties", {}).get("status", "")) or None
-            return None
-        except Exception as exc:
-            log.warning("pipeline_status_query_failed", mr_iid=mr_iid, exc=str(exc))
-            return None
+    # ------------------------------------------------------------------
+    # JSON DSL primitives
+    # ------------------------------------------------------------------
 
-    async def _run_query(
-        self, query: str, params: dict  # type: ignore[type-arg]
+    async def _traverse(
+        self, entity: str, filters: dict, limit: int = 10  # type: ignore[type-arg]
     ) -> list[dict]:  # type: ignore[type-arg]
-        """Execute an Orbit query with retry. Returns list of nodes on success."""
-        return await self._run_with_retry(query, params)
+        """Find nodes matching entity + filters (traversal query type)."""
+        return await self._run_with_retry({
+            "query": {
+                "query_type": "traversal",
+                "node": {"id": "n", "entity": entity, "filters": filters},
+                "limit": limit,
+            }
+        })
+
+    async def _get_neighbors(
+        self, entity: str, filters: dict  # type: ignore[type-arg]
+    ) -> list[dict]:  # type: ignore[type-arg]
+        """Return all nodes adjacent to the node(s) matching entity + filters."""
+        return await self._run_with_retry({
+            "query": {
+                "query_type": "neighbors",
+                "node": {"id": "n", "entity": entity, "filters": filters},
+                "neighbors": {"node": "n"},
+            }
+        })
 
     @retry(
         retry=retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError)),
@@ -411,15 +354,10 @@ class OrbitClient:
         reraise=True,
     )
     async def _run_with_retry(
-        self, query: str, params: dict  # type: ignore[type-arg]
+        self, payload: dict  # type: ignore[type-arg]
     ) -> list[dict]:  # type: ignore[type-arg]
+        """Execute an Orbit JSON DSL query payload with retry. Returns flat node list."""
         t0 = time.monotonic()
-        payload = {
-            "query": query.strip(),
-            "parameters": params,
-            "timeout": self._config.orbit_timeout_seconds * 1000,
-        }
-
         response = await self._client.post("/api/v4/orbit/query", json=payload)
 
         elapsed = int((time.monotonic() - t0) * 1000)
@@ -434,18 +372,27 @@ class OrbitClient:
         if response.status_code >= 500:
             raise httpx.NetworkError(f"Orbit returned {response.status_code}")
 
+        if response.status_code == 400:
+            body = response.json()
+            log.error(
+                "orbit_query_invalid",
+                error=body.get("error") or body.get("message"),
+                code=body.get("code"),
+            )
+            return []
+
         response.raise_for_status()
 
         body = response.json()
-        if "error" in body:
-            log.error("orbit_query_error", error=body["error"])
+        if "error" in body or ("code" in body and "message" in body):
+            log.error(
+                "orbit_query_error",
+                error=body.get("error") or body.get("message"),
+                code=body.get("code"),
+            )
             return []
 
-        if "data" not in body:
-            log.warning("orbit_response_missing_data_key")
-            return []
-
-        return body["data"].get("nodes", [])
+        return body.get("result", {}).get("nodes", [])
 
     @staticmethod
     def _orbit_miss(frame: StackFrame) -> SymbolHistory:

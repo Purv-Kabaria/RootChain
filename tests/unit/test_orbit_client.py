@@ -18,7 +18,7 @@ from src.rootchain.orbit_client import (
 
 
 # ---------------------------------------------------------------------------
-# Helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 
@@ -32,6 +32,38 @@ def _make_frame(func: str = "processPayment", path: str = "payments/processor.py
         frame_depth=1,
         raw_line=f"{path}:142 in {func}",
     )
+
+
+def _orbit_entity(request: httpx.Request) -> str:
+    """Extract the Orbit DSL entity from a POST /api/v4/orbit/query request."""
+    body = json.loads(request.content)
+    return body.get("query", {}).get("node", {}).get("entity", "")
+
+
+def _vuln_nodes(findings: list[dict]) -> dict:  # type: ignore[type-arg]
+    """Build an Orbit response containing Vulnerability nodes (flat properties)."""
+    return {
+        "result": {
+            "nodes": [
+                {"id": f"v:{i}", "type": "Vulnerability", **f}
+                for i, f in enumerate(findings)
+            ],
+            "edges": [],
+        }
+    }
+
+
+def _pipeline_nodes(pipelines: list[dict]) -> dict:  # type: ignore[type-arg]
+    """Build an Orbit response containing Pipeline nodes (flat properties)."""
+    return {
+        "result": {
+            "nodes": [
+                {"id": f"p:{i}", "type": "Pipeline", **p}
+                for i, p in enumerate(pipelines)
+            ],
+            "edges": [],
+        }
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -65,10 +97,10 @@ def test_days_since_none():
 
 @pytest.mark.asyncio
 async def test_get_symbol_histories_happy_path(config, orbit_full_fixture):
+    """Strategy 1 (File neighbors) succeeds → orbit_miss=False."""
     frame = _make_frame()
 
     with respx.mock(base_url="https://gitlab.example.com") as mock:
-        # Primary Orbit query returns two MRs
         mock.post("/api/v4/orbit/query").mock(
             return_value=httpx.Response(200, json=orbit_full_fixture)
         )
@@ -82,6 +114,7 @@ async def test_get_symbol_histories_happy_path(config, orbit_full_fixture):
 
 @pytest.mark.asyncio
 async def test_get_symbol_histories_orbit_miss(config, orbit_empty_fixture):
+    """All strategies return empty → orbit_miss=True."""
     frame = _make_frame()
 
     with respx.mock(base_url="https://gitlab.example.com") as mock:
@@ -97,8 +130,10 @@ async def test_get_symbol_histories_orbit_miss(config, orbit_empty_fixture):
 
 
 @pytest.mark.asyncio
-async def test_get_symbol_histories_fallback_on_empty(config, orbit_empty_fixture, orbit_full_fixture):
-    """First (primary) query empty → should try fallback → fallback_used=True."""
+async def test_get_symbol_histories_fallback_on_empty(
+    config, orbit_empty_fixture, orbit_full_fixture
+):
+    """Strategy 1 (File) empty → Strategy 2 (MergeRequestDiffFile) returns MRs."""
     frame = _make_frame()
 
     call_count = 0
@@ -106,11 +141,14 @@ async def test_get_symbol_histories_fallback_on_empty(config, orbit_empty_fixtur
     def _handler(request: httpx.Request) -> httpx.Response:
         nonlocal call_count
         call_count += 1
-        # First call (primary definition query) returns empty
-        if call_count == 1:
+        entity = _orbit_entity(request)
+        # Strategy 1: File neighbors → empty
+        if entity == "File":
             return httpx.Response(200, json=orbit_empty_fixture)
-        # Second call (file-level fallback) returns a result
-        return httpx.Response(200, json=orbit_full_fixture)
+        # Strategy 2: MergeRequestDiffFile neighbors → has MRs
+        if entity == "MergeRequestDiffFile":
+            return httpx.Response(200, json=orbit_full_fixture)
+        return httpx.Response(200, json=orbit_empty_fixture)
 
     with respx.mock(base_url="https://gitlab.example.com") as mock:
         mock.post("/api/v4/orbit/query").mock(side_effect=_handler)
@@ -119,12 +157,12 @@ async def test_get_symbol_histories_fallback_on_empty(config, orbit_empty_fixtur
             histories = await client.get_symbol_histories([frame])
 
     assert not histories[0].orbit_miss
-    assert histories[0].fallback_used
+    assert len(histories[0].recent_mrs) > 0
 
 
 @pytest.mark.asyncio
 async def test_get_symbol_histories_500_then_success(config, orbit_full_fixture):
-    """5xx should be retried — second attempt succeeds."""
+    """5xx triggers tenacity retry — second attempt succeeds."""
     frame = _make_frame()
     call_count = 0
 
@@ -146,11 +184,13 @@ async def test_get_symbol_histories_500_then_success(config, orbit_full_fixture)
 
 @pytest.mark.asyncio
 async def test_get_symbol_histories_exception_returns_orbit_miss(config):
-    """Network exception on a single frame should yield orbit_miss, not crash."""
+    """Network exception on a frame yields orbit_miss rather than crashing."""
     frame = _make_frame()
 
     with respx.mock(base_url="https://gitlab.example.com") as mock:
-        mock.post("/api/v4/orbit/query").mock(side_effect=httpx.NetworkError("connection refused"))
+        mock.post("/api/v4/orbit/query").mock(
+            side_effect=httpx.NetworkError("connection refused")
+        )
 
         async with OrbitClient(config) as client:
             histories = await client.get_symbol_histories([frame])
@@ -160,7 +200,7 @@ async def test_get_symbol_histories_exception_returns_orbit_miss(config):
 
 @pytest.mark.asyncio
 async def test_orbit_response_error_key(config):
-    """Orbit returning {"error": "..."} should be treated as orbit_miss."""
+    """Orbit returning {"error": "..."} body is treated as orbit_miss."""
     frame = _make_frame()
 
     with respx.mock(base_url="https://gitlab.example.com") as mock:
@@ -176,7 +216,7 @@ async def test_orbit_response_error_key(config):
 
 @pytest.mark.asyncio
 async def test_cache_reuses_result(config, orbit_full_fixture):
-    """Sequential calls for the same frame should reuse cached results (zero extra queries)."""
+    """Second call for the same frame hits cache — no extra HTTP requests."""
     frame = _make_frame()
 
     call_count = 0
@@ -190,16 +230,14 @@ async def test_cache_reuses_result(config, orbit_full_fixture):
         mock.post("/api/v4/orbit/query").mock(side_effect=_handler)
 
         async with OrbitClient(config) as client:
-            # First call — populates cache
             await client.get_symbol_histories([frame])
             first_call_count = call_count
 
-            # Second call for same frame — cache hit, no new HTTP calls
             await client.get_symbol_histories([frame])
             second_call_count = call_count - first_call_count
 
-    assert first_call_count > 0  # first call did make requests
-    assert second_call_count == 0  # second call was served from cache
+    assert first_call_count > 0
+    assert second_call_count == 0
 
 
 @pytest.mark.asyncio
@@ -231,96 +269,49 @@ async def test_check_health_unhealthy(config):
 
 
 # ---------------------------------------------------------------------------
-# _get_security_findings
+# Security findings
 # ---------------------------------------------------------------------------
-
-
-def _vuln_response(findings: list[dict]) -> dict:  # type: ignore[type-arg]
-    return {
-        "data": {
-            "nodes": [
-                {
-                    "id": f"v:{i}",
-                    "type": "Vulnerability",
-                    "properties": f,
-                }
-                for i, f in enumerate(findings)
-            ]
-        }
-    }
 
 
 @pytest.mark.asyncio
 async def test_get_security_findings_returns_findings(config, orbit_empty_fixture):
-    """Security query returns two active findings — both surfaced in SymbolHistory."""
+    """When orbit_miss, security findings are empty (not queried)."""
     frame = _make_frame()
 
-    vuln_payload = _vuln_response([
-        {
-            "name": "SQL Injection in processPayment",
-            "severity": "critical",
-            "state": "detected",
-            "report_type": "sast",
-            "web_url": "https://gitlab.example.com/myorg/myapp/-/security/vulnerabilities/1",
-        },
-        {
-            "name": "Path traversal risk",
-            "severity": "high",
-            "state": "confirmed",
-            "report_type": "sast",
-            "web_url": "https://gitlab.example.com/myorg/myapp/-/security/vulnerabilities/2",
-        },
-    ])
-
-    call_count = 0
-
-    def _handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        body = json.loads(request.content)
-        # Primary + fallback + security = 3 queries for an orbit_miss case after fallback
-        # (primary → empty, fallback → empty → orbit_miss; security never called on orbit_miss)
-        # Instead: primary → full, caller_count → empty, security → vuln_payload, enrichment queries
-        if "Vulnerability" in body.get("query", ""):
-            return httpx.Response(200, json=vuln_payload)
-        return httpx.Response(200, json=orbit_empty_fixture)
-
     with respx.mock(base_url="https://gitlab.example.com") as mock:
-        mock.post("/api/v4/orbit/query").mock(side_effect=_handler)
+        mock.post("/api/v4/orbit/query").mock(
+            return_value=httpx.Response(200, json=orbit_empty_fixture)
+        )
 
         async with OrbitClient(config) as client:
             histories = await client.get_symbol_histories([frame])
 
-    # orbit_miss when all non-security queries returned empty
     assert histories[0].orbit_miss
-    # security_findings empty because orbit_miss short-circuits before security query
     assert histories[0].security_findings == []
 
 
 @pytest.mark.asyncio
-async def test_get_security_findings_on_successful_orbit_query(config, orbit_full_fixture):
-    """When the primary query succeeds, security findings are fetched and attached."""
+async def test_get_security_findings_on_successful_orbit_query(
+    config, orbit_full_fixture, orbit_empty_fixture
+):
+    """When MRs are found, security findings from Vulnerability traversal are attached."""
     frame = _make_frame()
 
-    vuln_payload = _vuln_response([
-        {
-            "name": "SQL Injection in processPayment",
-            "severity": "critical",
-            "state": "detected",
-            "report_type": "sast",
-            "web_url": "https://gitlab.example.com/myorg/myapp/-/security/vulnerabilities/1",
-        }
-    ])
-
-    empty = {"data": {"nodes": []}}
+    vuln_payload = _vuln_nodes([{
+        "name": "SQL Injection in processPayment",
+        "severity": "critical",
+        "state": "detected",
+        "report_type": "sast",
+        "web_url": "https://gitlab.example.com/myorg/myapp/-/security/vulnerabilities/1",
+    }])
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        query = body.get("query", "")
-        if "Vulnerability" in query:
+        entity = _orbit_entity(request)
+        if entity == "Vulnerability":
             return httpx.Response(200, json=vuln_payload)
-        # Primary MR query, caller_count, linked issues, reviewers, pipeline — all return empty
-        return httpx.Response(200, json=orbit_full_fixture if "Definition" in query else empty)
+        if entity == "File":
+            return httpx.Response(200, json=orbit_full_fixture)
+        return httpx.Response(200, json=orbit_empty_fixture)
 
     with respx.mock(base_url="https://gitlab.example.com") as mock:
         mock.post("/api/v4/orbit/query").mock(side_effect=_handler)
@@ -335,18 +326,19 @@ async def test_get_security_findings_on_successful_orbit_query(config, orbit_ful
 
 
 @pytest.mark.asyncio
-async def test_get_security_findings_exception_returns_empty(config, orbit_full_fixture):
-    """If security query raises, _get_security_findings returns [] without crashing."""
+async def test_get_security_findings_exception_returns_empty(
+    config, orbit_full_fixture, orbit_empty_fixture
+):
+    """Network error on security query returns [] without crashing."""
     frame = _make_frame()
-    call_count = 0
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        body = json.loads(request.content)
-        if "Vulnerability" in body.get("query", ""):
+        entity = _orbit_entity(request)
+        if entity == "Vulnerability":
             raise httpx.NetworkError("Orbit security domain unreachable")
-        return httpx.Response(200, json=orbit_full_fixture if "Definition" in body.get("query", "") else {"data": {"nodes": []}})
+        if entity == "File":
+            return httpx.Response(200, json=orbit_full_fixture)
+        return httpx.Response(200, json=orbit_empty_fixture)
 
     with respx.mock(base_url="https://gitlab.example.com") as mock:
         mock.post("/api/v4/orbit/query").mock(side_effect=_handler)
@@ -359,43 +351,30 @@ async def test_get_security_findings_exception_returns_empty(config, orbit_full_
 
 
 # ---------------------------------------------------------------------------
-# _get_pipeline_status
+# Pipeline status
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_pipeline_status_passed_attached_to_mr(config, orbit_full_fixture):
-    """Pipeline status 'passed' is fetched and surfaced on the enriched MR."""
+async def test_pipeline_status_passed_attached_to_mr(
+    config, orbit_full_fixture, orbit_empty_fixture
+):
+    """Pipeline 'passed' surfaced on the enriched MR via MergeRequest neighbors."""
     frame = _make_frame()
 
-    pipeline_payload = {
-        "data": {
-            "nodes": [
-                {
-                    "id": "p:1",
-                    "type": "Pipeline",
-                    "properties": {
-                        "status": "passed",
-                        "web_url": "https://gitlab.example.com/myorg/myapp/-/pipelines/99",
-                        "created_at": "2024-01-11T15:00:00Z",
-                    },
-                }
-            ]
-        }
-    }
-
-    empty = {"data": {"nodes": []}}
+    enrichment_payload = _pipeline_nodes([{
+        "status": "passed",
+        "web_url": "https://gitlab.example.com/myorg/myapp/-/pipelines/99",
+        "created_at": "2024-01-11T15:00:00Z",
+    }])
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        query = body.get("query", "")
-        if "Pipeline" in query:
-            return httpx.Response(200, json=pipeline_payload)
-        if "Vulnerability" in query:
-            return httpx.Response(200, json=empty)
-        if "Definition" in query:
+        entity = _orbit_entity(request)
+        if entity == "MergeRequest":
+            return httpx.Response(200, json=enrichment_payload)
+        if entity == "File":
             return httpx.Response(200, json=orbit_full_fixture)
-        return httpx.Response(200, json=empty)
+        return httpx.Response(200, json=orbit_empty_fixture)
 
     with respx.mock(base_url="https://gitlab.example.com") as mock:
         mock.post("/api/v4/orbit/query").mock(side_effect=_handler)
@@ -409,16 +388,17 @@ async def test_pipeline_status_passed_attached_to_mr(config, orbit_full_fixture)
 
 
 @pytest.mark.asyncio
-async def test_pipeline_status_none_when_no_pipeline(config, orbit_full_fixture):
-    """If no Pipeline node is returned, pipeline_status is None."""
+async def test_pipeline_status_none_when_no_pipeline(
+    config, orbit_full_fixture, orbit_empty_fixture
+):
+    """No Pipeline node in enrichment → pipeline_status is None."""
     frame = _make_frame()
-    empty = {"data": {"nodes": []}}
 
     def _handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        if "Definition" in body.get("query", ""):
+        entity = _orbit_entity(request)
+        if entity == "File":
             return httpx.Response(200, json=orbit_full_fixture)
-        return httpx.Response(200, json=empty)
+        return httpx.Response(200, json=orbit_empty_fixture)
 
     with respx.mock(base_url="https://gitlab.example.com") as mock:
         mock.post("/api/v4/orbit/query").mock(side_effect=_handler)
