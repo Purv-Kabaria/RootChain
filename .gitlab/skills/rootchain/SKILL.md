@@ -124,107 +124,123 @@ Then add the label `rootchain-analyzed` and stop.
 
 ## How to Query Orbit
 
-Use the `query_graph` tool for all Orbit queries.
+Use the `query_graph` tool for all Orbit queries. Orbit uses a **JSON DSL** —
+pass a JSON object with `query_type`, `node`, and optional `limit` or `neighbors`.
+Do **not** use Cypher string syntax.
 
-### Primary query (definition-level)
+### Query types
 
-```cypher
-MATCH (d:Definition {name: $function_name})
-      -[:DEFINED_IN]->(f:File {path: $file_path})
-      <-[:MODIFIES_FILE]-(mr:MergeRequest)
-WHERE mr.merged_at IS NOT NULL
-  AND mr.project_full_path STARTS WITH $group_path
-RETURN mr.iid, mr.title, mr.description, mr.web_url,
-       mr.merged_at, mr.author_username
-ORDER BY mr.merged_at DESC LIMIT 3
+**`traversal`** — find nodes matching an entity and filter:
+```json
+{
+  "query": {
+    "query_type": "traversal",
+    "node": {"id": "n", "entity": "EntityName", "filters": {"field": "value"}},
+    "limit": 10
+  }
+}
 ```
 
-Replace `$function_name` with the actual function name, `$file_path` with the
-actual file path, and `$group_path` with the top-level group path.
-
-### Fallback query (file-level — use if primary returns 0 results)
-
-```cypher
-MATCH (f:File {path: $file_path})
-      <-[:MODIFIES_FILE]-(mr:MergeRequest)
-WHERE mr.merged_at IS NOT NULL
-  AND mr.project_full_path STARTS WITH $group_path
-RETURN mr.iid, mr.title, mr.description, mr.web_url,
-       mr.merged_at, mr.author_username
-ORDER BY mr.merged_at DESC LIMIT 3
+**`neighbors`** — return all graph nodes adjacent to matching node(s):
+```json
+{
+  "query": {
+    "query_type": "neighbors",
+    "node": {"id": "n", "entity": "EntityName", "filters": {"field": "value"}},
+    "neighbors": {"node": "n"}
+  }
+}
 ```
 
-If this also returns 0 results: mark the frame as `orbit_miss`. Do not guess
-or fabricate MR information.
+### Step 1: Find MRs for each frame (multi-strategy)
 
-### Linked work items query (run for each MR found)
+Orbit's `File → MergeRequest` graph edge is not always indexed. Use this
+strategy cascade — stop at the first strategy that returns MR nodes:
 
-```cypher
-MATCH (mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
-      -[:CLOSES|MENTIONED_IN]->(wi:WorkItem)
-RETURN wi.iid, wi.title, wi.state, wi.web_url
+**Strategy 1 — File neighbors** (direct; fastest when indexed):
+```json
+{
+  "query": {
+    "query_type": "neighbors",
+    "node": {"id": "n", "entity": "File", "filters": {"path": "<file_path>"}},
+    "neighbors": {"node": "n"}
+  }
+}
+```
+Filter response nodes by `"type": "MergeRequest"`. If any exist, use them.
+
+**Strategy 2 — MergeRequestDiffFile neighbors** (one-hop via diff record):
+```json
+{
+  "query": {
+    "query_type": "neighbors",
+    "node": {"id": "n", "entity": "MergeRequestDiffFile", "filters": {"new_path": "<file_path>"}},
+    "neighbors": {"node": "n"}
+  }
+}
+```
+Filter for `"type": "MergeRequest"` nodes. If any, use them.
+
+**Strategy 3 — old_path fallback** (for renamed files):
+Same as Strategy 2 but `"old_path": "<file_path>"`. Set `fallback_used = true` if
+this is the only strategy that succeeds (reduce confidence by 0.7×).
+
+**If all strategies return 0 MR nodes:** mark the frame as `orbit_miss`.
+Do not guess or fabricate MR information.
+
+### Step 2: Enrich each MR (linked issues, reviewers, pipeline)
+
+One `neighbors` call per MR returns WorkItem, User, and Pipeline nodes together:
+```json
+{
+  "query": {
+    "query_type": "neighbors",
+    "node": {"id": "n", "entity": "MergeRequest", "filters": {"iid": <mr_iid>}},
+    "neighbors": {"node": "n"}
+  }
+}
 ```
 
-### Reviewers query (run for each MR found)
+From the response, filter by type:
+- `"WorkItem"` → linked issues (`iid`, `title`, `state`, `web_url`)
+- `"User"` → reviewers (`username`)
+- `"Pipeline"` → CI status (`status`, `web_url`); use the most recent by `created_at`
 
-```cypher
-MATCH (u:User)-[:REVIEWED]->(mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
-RETURN u.username
-```
-
-### Blast radius query (caller count — run for each frame's function name)
-
-This measures how many other functions call the target function. More callers =
-higher blast radius = function is more critical to the system.
-
-```cypher
-MATCH (caller:Definition)-[:CALLS]->(d:Definition {name: $function_name})
-RETURN count(caller) AS caller_count
-```
-
-If this query returns 0 or errors, use `caller_count = 0` (no blast contribution).
-The `blast` score component is `min(caller_count / 10.0, 1.0)`.
-
-### Security findings query (run for each frame's file path)
-
-This fetches active security vulnerabilities that affect the blamed file from
-Orbit's `security` domain. Run this **in parallel** with the caller count query.
-
-```cypher
-MATCH (f:File {path: $file_path})<-[:AFFECTS_FILE]-(v:Vulnerability)
-WHERE v.state IN ["detected", "confirmed"]
-RETURN v.name AS name, v.severity AS severity, v.state AS state,
-       v.report_type AS report_type, v.web_url AS web_url
-ORDER BY
-  CASE v.severity
-    WHEN "critical" THEN 1
-    WHEN "high"     THEN 2
-    WHEN "medium"   THEN 3
-    ELSE 4
-  END
-LIMIT 3
-```
-
-If no findings: skip the Security Context section in the output. Do not fabricate.
-
-### Pipeline status query (run for each MR found)
-
-This fetches the CI pipeline result for the MR from Orbit's `ci` domain.
-Run this **in parallel** with the linked issues and reviewers queries.
-
-```cypher
-MATCH (mr:MergeRequest {iid: $mr_iid, project_full_path: $project_path})
-      -[:HAS_PIPELINE]->(p:Pipeline)
-RETURN p.status AS status, p.web_url AS web_url, p.created_at AS created_at
-ORDER BY p.created_at DESC LIMIT 1
-```
-
-Map the pipeline status to a badge in the Last MR column:
+Pipeline status badge mapping:
 - `"passed"` → `✅ CI passed`
 - `"failed"` → `❌ CI failed`
 - `"running"` → `🔄 CI running`
 - `"pending"` → `⏳ CI pending`
-- `null` / no result → omit badge
+- not present → omit badge
+
+### Step 3: Blast radius (caller count per frame)
+
+```json
+{
+  "query": {
+    "query_type": "neighbors",
+    "node": {"id": "n", "entity": "Definition", "filters": {"name": "<function_name>"}},
+    "neighbors": {"node": "n"}
+  }
+}
+```
+Count neighbor nodes of type `"Definition"` whose `name` differs from `<function_name>`.
+That is the caller count. If 0 or query errors, use `caller_count = 0`.
+
+### Step 4: Security findings (per frame's file path)
+
+```json
+{
+  "query": {
+    "query_type": "traversal",
+    "node": {"id": "n", "entity": "Vulnerability", "filters": {"file_path": "<file_path>"}},
+    "limit": 3
+  }
+}
+```
+Filter nodes where `state` is `"detected"` or `"confirmed"`. Sort by severity
+(critical → high → medium → low). If no findings: skip the Security Context section.
+Do not fabricate.
 
 ---
 
@@ -234,31 +250,38 @@ The `query_graph` tool returns a result with `nodes` and `edges`:
 
 ```json
 {
-  "data": {
+  "result": {
     "nodes": [
-      {"id": "mr:1234", "type": "MergeRequest", "properties": {...}},
-      {"id": "wi:89",   "type": "WorkItem",     "properties": {...}}
+      {"id": "mr:1234", "type": "MergeRequest", "iid": 1234, "title": "...",
+       "merged_at": "2024-01-11T14:23:00Z", "author_username": "alice",
+       "web_url": "https://gitlab.com/..."},
+      {"id": "wi:89", "type": "WorkItem", "iid": 89, "title": "...", "state": "closed"}
     ],
-    "edges": [
-      {"source": "mr:1234", "target": "wi:89", "type": "CLOSES"}
-    ]
+    "edges": []
   }
 }
 ```
 
-Always check that `data` key exists before accessing nodes. On error, the
-response is `{"error": "..."}` — treat this as `orbit_miss`.
+**Key facts about the response format:**
+- The top-level key is `"result"`, not `"data"`.
+- Node properties are **flat** on the node object — there is no `"properties"` sub-dict.
+- If `"result"` is missing or `"error"` key is present, treat the frame as `orbit_miss`.
+- `merged_at` is ISO 8601 UTC (e.g., `"2024-01-15T02:14:37Z"`) — always parse and compute
+  `days_since_merge = (now_utc - merged_at).days`.
+- `iid` can be returned as a string from ClickHouse — always convert to integer.
+- `web_url` and `merged_at` may be absent on MergeRequest nodes from traversal queries.
+  If `web_url` is missing: construct it as `{gitlab_url}/{project_path}/-/merge_requests/{iid}`.
+  If `merged_at` is missing: check if `"state": "merged"` is present; if so, the MR is merged
+  but the timestamp is not yet indexed. Use `state == "merged"` as evidence, compute recency = 0.5
+  (conservative estimate).
 
-Filter nodes by `type`:
-- `MergeRequest` nodes for MR data
-- `WorkItem` nodes for linked issues
-- `User` nodes for reviewer data
-
-The `properties.merged_at` field is ISO 8601 UTC (e.g., `"2024-01-15T02:14:37Z"`).
-Always parse it and compute `days_since_merge = (now_utc - merged_at).days`.
-
-The `properties.iid` can be returned as a string from ClickHouse — always
-convert to integer before comparing or displaying.
+Filter nodes by `"type"`:
+- `"MergeRequest"` — MR data
+- `"WorkItem"` — linked issues
+- `"User"` — reviewer data
+- `"Pipeline"` — CI pipeline status
+- `"Definition"` — symbol/function nodes (for blast radius counting)
+- `"Vulnerability"` — security findings
 
 ---
 
