@@ -180,6 +180,8 @@ The agent parses the GitLab issue description to extract a `SentryEvent` structu
 | Go | `goroutine N [...]\npackage.Func(...)` | `runtime/`, `vendor/` |
 | Ruby | `path:N:in 'method'` | `gems/`, `/usr/` |
 | Java | `at class.method(File.java:N)` | `java.`, `sun.`, `com.google.` |
+| Kotlin | Same JVM format as Java; `.kt` extension triggers Kotlin detection | Same as Java plus `kotlin.`, `kotlinx.` |
+| Rust | Two-line: `N: func::path` then `  at file.rs:N`; also `thread 'x' panicked at` | `std::`, `core::`, `alloc::`, `tokio::`, `hyper::`, `actix_` |
 
 **Frame filtering (in order):**
 1. Remove frames matching library path patterns
@@ -1287,7 +1289,7 @@ A: Yes. Any GitLab issue with a stack trace in the description and the `sentry-a
 A: Yes, if your instance has Orbit Remote enabled (requires Ultimate tier with ClickHouse). Set `ROOTCHAIN_GITLAB_URL` to your instance URL.
 
 **Q: What languages are supported?**  
-A: Python, Node.js/JavaScript/TypeScript, Go, Ruby, Java. Go adds goroutine header parsing; Java adds `Caused by:` chain handling. Unknown languages attempt generic frame detection.
+A: Python, Node.js/JavaScript/TypeScript, Go, Ruby, Java, Kotlin, and Rust. Kotlin uses the same JVM frame format as Java but is detected via `.kt` file extension and tagged separately. Rust handles both the old panic format and the Rust 1.73+ two-line frame format. Unknown languages attempt generic frame detection.
 
 **Q: What happens if the MR has no linked issues?**  
 A: RootChain shows the MR title and author without issue context. It will not fabricate intent.
@@ -1354,5 +1356,7 @@ The blast radius dimension (counting callers via the `CALLS` graph edge) is part
 ## Hackathon Context
 
 Built for the [GitLab Transcend Hackathon](https://gitlab-transcend.devpost.com/) — Showcase Track.
+
+**Source code:** [github.com/Purv-Kabaria/RootChain](https://github.com/Purv-Kabaria/RootChain)
 
 **The story:** Every on-call engineer has spent the dead hours of night reconstructing context that already existed inside GitLab. RootChain collapses that reconstruction into a 2-minute automatic analysis. The insight is not that AI can help you debug — it's that GitLab's own SDLC graph, queried via Orbit, already contains the answer. RootChain is just the bridge between the runtime signal and the historical context.

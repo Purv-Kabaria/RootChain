@@ -177,6 +177,8 @@ settings under **Additional Labels**.
 | Go | `goroutine N [...]\nfunc(args)\n\tfile.go:line` | `/usr/local/go/`, `vendor/` |
 | Ruby | `path:line:in 'method'` | `gems/`, `rubygems/` |
 | Java | `at class.method(File.java:line)` | `java.`, `sun.`, `javax.`, `org.springframework.` |
+| Kotlin | Same JVM format as Java; detected via `.kt` file extension | Same as Java plus `kotlin.`, `kotlinx.` |
+| Rust | `N: func::path\n  at file.rs:line` (two-line format); also handles `thread 'main' panicked at` | `std::`, `core::`, `alloc::`, `tokio::`, `hyper::`, `actix_`, `futures_` |
 
 For unknown languages, RootChain tries all parsers in order and uses the first
 that yields parseable frames.
