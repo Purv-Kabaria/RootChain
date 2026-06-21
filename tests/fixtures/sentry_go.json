@@ -1,0 +1,5 @@
+{
+  "title": "[Sentry] panic: runtime error: index out of range [5] with length 3",
+  "description": "## panic: runtime error: index out of range\n\n**Sentry Issue:** https://sentry.io/organizations/myorg/issues/9876543/\n\n**Culprit:** payments/processor.go in processPayment\n\n**Times seen:** 8\n**Environment:** production\n\n### Stacktrace\n\n```\npanic: runtime error: index out of range [5] with length 3\n\ngoroutine 42 [running]:\ngithub.com/myorg/app/payments.processPayment(0xc0001a4000, 0x5)\n\t/app/payments/processor.go:142 +0x1f4\ngithub.com/myorg/app/api.handlePayment(0x14000123456)\n\t/app/api/handler.go:88 +0x9c\nnet/http.HandlerFunc.ServeHTTP(0x14000123456, 0x1400034f780, 0x14000305b40)\n\t/usr/local/go/src/net/http/server.go:2136 +0x34\n```\n",
+  "labels": ["sentry-alert", "Sentry"]
+}

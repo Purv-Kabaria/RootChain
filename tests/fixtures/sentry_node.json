@@ -1,0 +1,5 @@
+{
+  "title": "[Sentry] ReferenceError: Cannot read properties of undefined (reading 'userId')",
+  "description": "## ReferenceError: Cannot read properties of undefined (reading 'userId')\n\n**Sentry Issue:** https://sentry.io/organizations/myorg/issues/7654321/\n\n**Culprit:** payments/checkout.js in processOrder\n\n**Times seen:** 23\n**Environment:** production\n\n### Stacktrace\n\n```\nReferenceError: Cannot read properties of undefined (reading 'userId')\n    at processOrder (payments/checkout.js:89:15)\n    at handleCheckout (api/routes/checkout.js:45:5)\n    at Layer.handle [as handle_request] (node_modules/express/lib/router/layer.js:95:5)\n    at next (node_modules/express/lib/router/route.js:144:13)\n```\n",
+  "labels": ["sentry-alert", "Sentry"]
+}

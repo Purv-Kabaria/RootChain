@@ -1,0 +1,5 @@
+{
+  "title": "[Sentry] TypeError: Cannot read property 'a' of null",
+  "description": "## TypeError: Cannot read property 'a' of null\n\n**Sentry Issue:** https://sentry.io/organizations/myorg/issues/1111111/\n\n**Environment:** production\n\n### Stacktrace\n\n```\nTypeError: Cannot read property 'a' of null\n    at <anonymous> (main.a1b2c3d.js:1:84921)\n    at <anonymous> (main.a1b2c3d.js:1:12345)\n    at <anonymous> (vendor.e4f5g6h.js:1:9999)\n```\n",
+  "labels": ["sentry-alert", "Sentry"]
+}

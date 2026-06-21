@@ -1,0 +1,10 @@
+{
+  "id": 1001,
+  "iid": 42,
+  "title": "[Sentry] TypeError: 'NoneType' object is not subscriptable",
+  "description": "## TypeError: 'NoneType' object is not subscriptable\n\n**Sentry Issue:** https://sentry.io/organizations/myorg/issues/1234567/\n\n**Culprit:** `payments/processor.py in processPayment`\n\n**Times seen:** 47\n**Users affected:** 12\n**Environment:** production\n**First seen:** 2024-01-15T02:14:37Z\n**Last seen:** 2024-01-15T02:47:12Z\n\n### Stacktrace\n\n```\nTraceback (most recent call last):\n  File \"/app/payments/processor.py\", line 142, in processPayment\n    result_id = gateway_response['id']\n  File \"/app/payments/gateway.py\", line 88, in call_gateway\n    return self._session.post(url, data=payload)\n  File \"/app/core/session.py\", line 34, in post\n    return requests.post(self.base_url + path, **kwargs)\n  File \"/usr/local/lib/python3.11/site-packages/requests/api.py\", line 73, in post\n    return request('post', url, data=data, json=json, **kwargs)\nTypeError: 'NoneType' object is not subscriptable\n```\n",
+  "labels": ["sentry-alert", "Sentry"],
+  "state": "opened",
+  "web_url": "https://gitlab.com/myorg/myapp/-/issues/42",
+  "project_id": 999
+}

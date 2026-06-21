@@ -1,0 +1,5 @@
+{
+  "title": "[Sentry] NoMethodError: undefined method 'charge' for nil:NilClass",
+  "description": "## NoMethodError: undefined method 'charge' for nil:NilClass\n\n**Sentry Issue:** https://sentry.io/organizations/myorg/issues/5555555/\n\n**Culprit:** app/services/payment_service.rb in charge_customer\n\n**Times seen:** 12\n**Environment:** production\n\n### Stacktrace\n\n```\napp/services/payment_service.rb:67:in `charge_customer'\napp/controllers/payments_controller.rb:32:in `create'\n/usr/local/bundle/gems/rack-2.2.6/lib/rack/handler/webrick.rb:95:in `service'\n/usr/local/bundle/gems/rack-2.2.6/lib/rack/server.rb:153:in `start'\n```\n\nNoMethodError: undefined method 'charge' for nil:NilClass\n",
+  "labels": ["sentry-alert", "Sentry"]
+}
