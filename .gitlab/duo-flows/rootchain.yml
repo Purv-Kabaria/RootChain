@@ -11,7 +11,8 @@ description: >
 version: 1
 
 trigger:
-  event: work_item_created
+  events:
+    - work_item_created
 
 filter:
   labels:
