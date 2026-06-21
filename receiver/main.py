@@ -11,6 +11,7 @@ import hmac
 import json
 import os
 import sys
+import uuid
 
 import structlog
 import uvicorn
@@ -51,9 +52,40 @@ def _verify_sentry_signature(body: bytes, signature: str | None, secret: str) ->
     return hmac.compare_digest(expected, signature)
 
 
+@app.middleware("http")
+async def attach_request_id(request: Request, call_next):  # type: ignore[type-arg]
+    """Attach a unique X-RootChain-Request-ID header to every response for tracing."""
+    request_id = request.headers.get("X-RootChain-Request-ID") or str(uuid.uuid4())
+    structlog.contextvars.bind_contextvars(request_id=request_id)
+    response = await call_next(request)
+    response.headers["X-RootChain-Request-ID"] = request_id
+    structlog.contextvars.unbind_contextvars("request_id")
+    return response
+
+
 @app.get("/health")
 async def health() -> dict:  # type: ignore[type-arg]
-    return {"status": "ok", "version": "0.1.0"}
+    """Return live config summary and Orbit connectivity status."""
+    config = _get_config()
+    from src.rootchain.orbit_client import OrbitClient
+    orbit_status = "unknown"
+    try:
+        async with OrbitClient(config) as orbit:
+            result = await orbit.check_health()
+            from src.rootchain.models import Ok
+            orbit_status = "healthy" if isinstance(result, Ok) else "unreachable"
+    except Exception:
+        orbit_status = "unreachable"
+
+    return {
+        "status": "ok",
+        "version": "0.1.0",
+        "orbit": orbit_status,
+        "project_path": config.project_path,
+        "group_path": config.group_path,
+        "max_frames": config.max_frames,
+        "confidence_threshold": config.confidence_threshold,
+    }
 
 
 @app.post("/webhook/sentry")
