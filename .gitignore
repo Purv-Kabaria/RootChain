@@ -58,3 +58,6 @@ fly.log
 # Node (if any tooling is added)
 node_modules/
 .playwright-mcp
+
+# Docs (local only — not version-controlled)
+docs/
