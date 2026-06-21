@@ -58,9 +58,16 @@ def _node_str(node: dict, *keys: str, default: str = "") -> str:
 
 
 def _filter_merged_mrs(nodes: list[dict]) -> list[dict]:
-    """Extract merged MergeRequest nodes from a flat node list, sorted by merge date desc."""
-    mrs = [n for n in nodes if n.get("type") == "MergeRequest" and n.get("merged_at")]
-    return sorted(mrs, key=lambda n: n.get("merged_at", ""), reverse=True)
+    """Extract merged MergeRequest nodes from a flat node list, sorted by merge date desc.
+
+    Orbit traversal may omit merged_at — accept state='merged' as the fallback indicator.
+    """
+    mrs = [
+        n for n in nodes
+        if n.get("type") == "MergeRequest"
+        and (n.get("merged_at") or n.get("state") == "merged")
+    ]
+    return sorted(mrs, key=lambda n: n.get("merged_at") or "2020-01-01", reverse=True)
 
 
 def _dedup_mrs(mrs: list[dict]) -> list[dict]:
@@ -77,6 +84,7 @@ def _dedup_mrs(mrs: list[dict]) -> list[dict]:
 
 def _extract_mr_enrichment(
     neighbors: list[dict],
+    project_url: str = "",
 ) -> tuple[list[LinkedIssue], list[str], str | None]:
     """Parse WorkItem, User, and Pipeline nodes from a MergeRequest neighbors response."""
     linked: list[LinkedIssue] = []
@@ -93,10 +101,13 @@ def _extract_mr_enrichment(
             except (ValueError, TypeError):
                 continue
             if iid > 0:
+                wi_url = _node_str(node, "web_url", "url")
+                if not wi_url and project_url:
+                    wi_url = f"{project_url}/-/issues/{iid}"
                 linked.append(LinkedIssue(
                     iid=iid,
                     title=_node_str(node, "title"),
-                    web_url=_node_str(node, "web_url", "url"),
+                    web_url=wi_url,
                     state=_node_str(node, "state", default="unknown"),
                 ))
 
@@ -263,6 +274,12 @@ class OrbitClient:
             log.debug("orbit_old_path_hit", file_path=file_path, count=len(mrs))
             return mrs[:3], True  # fallback_used = True (renamed file path)
 
+        # Strategy 5: GitLab commits API + Orbit enrichment (reliable fallback)
+        mrs = await self._find_mrs_via_commits_api(file_path)
+        if mrs:
+            log.debug("orbit_commits_api_hit", file_path=file_path, count=len(mrs))
+            return mrs[:3], False
+
         log.info("orbit_no_mr_data", file_path=file_path)
         return [], True
 
@@ -273,7 +290,15 @@ class OrbitClient:
 
         # One neighbors query returns WorkItem, User, and Pipeline nodes together
         neighbors = await self._get_neighbors("MergeRequest", {"iid": mr_iid})
-        linked, reviewers, pipeline_status = _extract_mr_enrichment(neighbors)
+        project_url = f"{self._config.gitlab_url}/{self._config.project_path}"
+        linked, reviewers, pipeline_status = _extract_mr_enrichment(neighbors, project_url)
+
+        web_url = _node_str(mr_node, "web_url", "url")
+        if not web_url and mr_iid:
+            web_url = (
+                f"{self._config.gitlab_url}/{self._config.project_path}"
+                f"/-/merge_requests/{mr_iid}"
+            )
 
         return MRContext(
             iid=mr_iid,
@@ -281,7 +306,7 @@ class OrbitClient:
             description=_node_str(mr_node, "description"),
             author_username=_node_str(mr_node, "author_username", "author", default="unknown"),
             merged_at=merged_at,
-            web_url=_node_str(mr_node, "web_url", "url"),
+            web_url=web_url,
             linked_issues=linked,
             reviewers=reviewers,
             days_since_merge=_days_since(merged_at),
@@ -317,6 +342,59 @@ class OrbitClient:
             return findings
         except Exception as exc:
             log.warning("security_query_failed", file_path=file_path, exc=str(exc))
+            return []
+
+    async def _find_mrs_via_commits_api(self, file_path: str) -> list[dict]:
+        """GitLab REST commits API: file_path → commits → MRs (fallback when Orbit lacks edges)."""
+        try:
+            encoded_project = self._config.project_path.replace("/", "%2F")
+            commits_r = await self._client.get(
+                f"/api/v4/projects/{encoded_project}/repository/commits",
+                params={"path": file_path, "ref_name": "main", "per_page": 10},
+            )
+            if commits_r.status_code != 200:
+                return []
+
+            rest_mrs: dict[int, dict] = {}  # iid → REST MR payload
+            for commit in commits_r.json()[:5]:
+                sha = commit.get("id", "")
+                if not sha:
+                    continue
+                mr_r = await self._client.get(
+                    f"/api/v4/projects/{encoded_project}/repository/commits/{sha}/merge_requests"
+                )
+                if mr_r.status_code != 200:
+                    continue
+                for mr in mr_r.json():
+                    iid = int(mr.get("iid", 0))
+                    if iid and mr.get("state") == "merged" and iid not in rest_mrs:
+                        rest_mrs[iid] = mr
+
+            if not rest_mrs:
+                return []
+
+            combined: list[dict] = []
+            for iid, rest_mr in rest_mrs.items():
+                orbit_nodes = await self._traverse("MergeRequest", {"iid": iid}, limit=1)
+                if orbit_nodes:
+                    node = orbit_nodes[0].copy()
+                else:
+                    node = {"type": "MergeRequest", "iid": iid, "state": "merged"}
+
+                # Supplement with REST fields Orbit omits
+                node.setdefault("merged_at", rest_mr.get("merged_at", ""))
+                node.setdefault("web_url", rest_mr.get("web_url", ""))
+                node.setdefault("title", rest_mr.get("title", ""))
+                node.setdefault("description", rest_mr.get("description", ""))
+                node.setdefault(
+                    "author_username",
+                    rest_mr.get("author", {}).get("username", ""),
+                )
+                combined.append(node)
+
+            return sorted(combined, key=lambda n: n.get("merged_at") or "", reverse=True)
+        except Exception as exc:
+            log.warning("commits_api_fallback_failed", file_path=file_path, exc=str(exc))
             return []
 
     # ------------------------------------------------------------------
