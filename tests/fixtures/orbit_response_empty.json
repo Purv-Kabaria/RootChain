@@ -1,11 +1,6 @@
 {
-  "data": {
+  "result": {
     "nodes": [],
     "edges": []
-  },
-  "meta": {
-    "query_time_ms": 12,
-    "node_count": 0,
-    "edge_count": 0
   }
 }
