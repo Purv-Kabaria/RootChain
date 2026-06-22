@@ -199,6 +199,22 @@ async def test_get_symbol_histories_exception_returns_orbit_miss(config):
 
 
 @pytest.mark.asyncio
+async def test_orbit_null_result_returns_empty_nodes(config):
+    """Orbit returning {"result": null} must not raise AttributeError."""
+    frame = _make_frame()
+
+    with respx.mock(base_url="https://gitlab.example.com") as mock:
+        mock.post("/api/v4/orbit/query").mock(
+            return_value=httpx.Response(200, json={"result": None})
+        )
+
+        async with OrbitClient(config) as client:
+            histories = await client.get_symbol_histories([frame])
+
+    assert histories[0].orbit_miss
+
+
+@pytest.mark.asyncio
 async def test_orbit_response_error_key(config):
     """Orbit returning {"error": "..."} body is treated as orbit_miss."""
     frame = _make_frame()

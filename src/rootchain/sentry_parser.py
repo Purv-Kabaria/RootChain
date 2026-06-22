@@ -2,7 +2,6 @@
 
 Handles Sentry, GitLab error tracking, CI failures, crash reports, and manually
 pasted tracebacks across Python, Node.js, Go, Ruby, Java, Kotlin, and Rust.
-Pure parsing logic — no I/O, no HTTP. Only imports: models, config, re, structlog.
 """
 
 from __future__ import annotations
@@ -15,10 +14,6 @@ from .config import Config
 from .models import Language, SentryEvent, StackFrame
 
 log = structlog.get_logger()
-
-# ---------------------------------------------------------------------------
-# Library path prefixes — frames matching these are filtered out
-# ---------------------------------------------------------------------------
 
 LIBRARY_PREFIXES = (
     # Python
@@ -75,10 +70,6 @@ SKIP_FUNCTION_NAMES = frozenset(
     ["<module>", "<anonymous>", "<lambda>", "main", "__main__", ""]
 )
 
-# ---------------------------------------------------------------------------
-# Language-specific frame regexes
-# ---------------------------------------------------------------------------
-
 _PY_FRAME = re.compile(
     r'File "(?P<path>[^"]+)",\s+line (?P<line>\d+),\s+in (?P<func>\S+)'
 )
@@ -134,9 +125,6 @@ _RUST_PANIC_NEW = re.compile(
 )
 
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _is_library(path: str) -> bool:
@@ -441,9 +429,6 @@ def _build_frames(
     return frames
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 _PARSE_FNS = {
     Language.PYTHON: _parse_python,

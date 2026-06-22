@@ -1,7 +1,4 @@
-"""GitLab REST API client for adding notes and labels to issues.
-
-No business logic. Only I/O: POST notes, PUT labels.
-"""
+"""GitLab REST API client: fetch issues, post notes, add labels."""
 
 from __future__ import annotations
 
@@ -12,6 +9,8 @@ import structlog
 
 from .config import Config
 from .models import Err, Ok, Result
+
+_IssueData = dict  # type alias for raw GitLab issue JSON
 
 log = structlog.get_logger()
 
@@ -39,6 +38,31 @@ class GitLabClient:
 
     async def __aexit__(self, *_: object) -> None:
         await self.close()
+
+    async def get_issue(
+        self, project_path: str, issue_iid: int
+    ) -> Result[_IssueData]:
+        """Fetch a GitLab issue. Returns the raw JSON payload on success."""
+        url = f"/projects/{_encode(project_path)}/issues/{issue_iid}"
+        try:
+            resp = await self._client.get(url)
+            if resp.status_code == 404:
+                return Err(
+                    message=f"Issue {issue_iid} not found in {project_path}",
+                    code="gitlab_not_found",
+                    retryable=False,
+                )
+            if resp.status_code == 403:
+                return Err(
+                    message="Token missing `api` scope or lacks project access. "
+                    "Check ROOTCHAIN_GITLAB_TOKEN.",
+                    code="gitlab_forbidden",
+                    retryable=False,
+                )
+            resp.raise_for_status()
+            return Ok(value=resp.json())
+        except httpx.HTTPError as exc:
+            return Err(message=str(exc), code="gitlab_http_error", retryable=True)
 
     async def add_note(
         self, project_path: str, issue_iid: int, body: str
@@ -73,9 +97,6 @@ class GitLabClient:
         except httpx.HTTPError as exc:
             return Err(message=str(exc), code="gitlab_http_error", retryable=True)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     async def _post_with_retry(
         self, url: str, payload: dict, label: str  # type: ignore[type-arg]

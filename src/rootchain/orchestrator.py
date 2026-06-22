@@ -1,7 +1,4 @@
-"""Entry point: wire all modules together. Contains no business logic.
-
-All business logic lives in the individual modules this file calls.
-"""
+"""Entry point: wire all modules together."""
 
 from __future__ import annotations
 
@@ -192,20 +189,15 @@ def main() -> None:
     config = Config.from_env()
     _configure_logging(config)
 
-    # Fetch issue from GitLab to get title, description, labels
     async def _fetch_and_run() -> None:
         async with GitLabClient(config) as gitlab:
-            import httpx
-            async with httpx.AsyncClient(
-                base_url=config.gitlab_api_url,
-                headers={"PRIVATE-TOKEN": config.gitlab_token},
-            ) as client:
-                from urllib.parse import quote
-                resp = await client.get(
-                    f"/projects/{quote(args.project_path, safe='')}/issues/{args.issue_iid}"
-                )
-                resp.raise_for_status()
-                issue = resp.json()
+            result = await gitlab.get_issue(args.project_path, args.issue_iid)
+            match result:
+                case Ok(value=issue):
+                    pass
+                case Err(message=msg):
+                    print(f"ERROR: could not fetch issue — {msg}", file=sys.stderr)
+                    sys.exit(1)
 
         await run_analysis(
             project_path=args.project_path,

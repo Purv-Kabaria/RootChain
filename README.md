@@ -1,1363 +1,401 @@
 # RootChain
 
-> **GitLab Duo Agent Platform · Showcase Track**
-> One YAML file. Drop it in any GitLab project. Automatically traces production errors to their SDLC origin in under 2 minutes.
+> One YAML file. Drop it in any GitLab project. When a production error lands as a GitLab issue, RootChain automatically traces the stack trace to the MR that introduced it — finding the causal change, its intent, and who to loop in — in under two minutes.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![GitLab Duo](https://img.shields.io/badge/GitLab-Duo%20Agent%20Platform-orange)](https://docs.gitlab.com/user/duo_agent_platform/)
 [![Orbit](https://img.shields.io/badge/GitLab-Orbit-blue)](https://docs.gitlab.com/orbit/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-green)](https://python.org)
 
-**Live demo:** [GitLab Issue #1 — RootChain analyzing its own Orbit query bug](https://gitlab.com/Purv-Kabaria-group/rootchain/-/issues/1)
-
 ---
 
 ## The Problem
 
-A production 500 error fires at 2am. Your on-call engineer opens the alert, sees a stack trace, and starts doing archaeology: `git blame` on each frame, grepping closed issues, finding the MR that introduced the change, messaging the author on Slack. This takes 30–90 minutes before a single line of fix is written. The answer has been sitting inside GitLab the whole time — in the MR that changed the function, the issue that motivated it, the reviewer who approved it — just disconnected from the runtime error.
+A production error fires at 2am. Your on-call engineer opens the alert, sees a stack trace, and spends the next 30–90 minutes doing archaeology: `git blame`, grepping closed issues, finding the MR that introduced the change, messaging the author. The answer has been sitting inside GitLab the whole time — in the MR that changed the function, in the issue that motivated it, in the reviewer who approved it — just disconnected from the runtime signal.
 
 **RootChain closes that gap.**
 
-When a production error lands as a GitLab issue — whether from Sentry, GitLab error tracking, a CI failure, a crash report, or a manually filed bug — RootChain's Duo Agent Platform flow automatically activates. It parses the stack trace, queries GitLab Orbit for the SDLC history of each relevant frame, and posts a structured blame-chain analysis back to the issue — identifying the most likely causal MR, the intent behind it, and who to loop in — within 2 minutes.
+When an error lands as a GitLab issue — from Sentry, GitLab error tracking, a CI failure, a crash report, or a manually filed bug — RootChain's Duo Agent Platform flow activates automatically. It parses the stack trace, queries GitLab Orbit for the SDLC history of each frame, and posts a structured blame-chain analysis directly to the issue.
 
-**What changes:** On-call engineers open the GitLab issue to find context already waiting for them. "This error was most likely introduced by MR !342 (4 days ago), which was implementing issue #89 (payment retry logic), approved by @alice. The function `processPayment()` was changed to add a retry branch that may not handle null gateway responses."
+**What engineers see when they open the issue:**
+
+```markdown
+## 🔗 RootChain SDLC Blame Analysis
+
+**Error:** `AttributeError: 'NoneType' object has no attribute 'get'`
+**Primary suspect:** MR !342 by @alice · 4 days ago
+
+| # | Function | File | Last MR | Intent | Author | Confidence |
+|---|----------|------|---------|--------|--------|------------|
+| 1 | _run_with_retry | orbit_client.py:473 | !342 · 4d ago · ✅ CI passed | #89: JSON DSL rewrite | @alice | 🔴 HIGH |
+| 2 | _find_mrs_for_file | orbit_client.py:243 | !342 · 4d ago | #89: JSON DSL rewrite | @alice | 🟡 MEDIUM |
+
+MR !342 rewrote the Orbit query layer from Cypher to JSON DSL. The change at line 473
+uses `body.get("result", {})` which silently fails when Orbit returns `{"result": null}` —
+the null case was handled in the original implementation but lost during the rewrite.
+
+**Suggested investigation:** Review `orbit_client.py` around line 473, specifically
+the `_run_with_retry` changes in MR !342.
+
+**Loop in:** @alice · @bob
+```
 
 ---
 
-## Demo Flow
+## How It Works
 
 ```
 Production error fires (Sentry / GitLab error tracking / CI failure / crash report)
-          │
-          ▼
+        │
+        ▼
 Error lands as a GitLab issue with a stack trace in the description
-          │
-          ▼
-work_item_created trigger activates RootChain flow
-          │
-          ▼
-Flow parses stack trace (Python / Node.js / Go / Ruby / Java / Rust)
-          │
-          ▼
-Orbit REST API queries: File → MergeRequest → WorkItem + User
-          │
-          ▼
-Agent builds ranked blame-chain (confidence-scored per frame)
-          │
-          ▼
-Issue updated with structured analysis comment in < 2 minutes
-          │
-          ▼
-On-call engineer sees: primary suspect MR, intent, author, suggested fix path
+        │
+        ▼
+work_item_created trigger activates the RootChain flow
+        │
+        ▼
+Flow reads the issue, parses the stack trace (Python / Node.js / Go / Ruby / Java / Rust)
+        │
+        ▼
+Orbit JSON DSL queries: File → MergeRequest → WorkItem + User + Pipeline
+        │
+        ▼
+Agent builds a confidence-scored blame chain and posts it as a comment
+        │
+        ▼
+On-call engineer sees: primary suspect MR, intent, author, and a suggested fix path
 ```
+
+### Why This Is Non-Obvious
+
+Most Orbit use cases are forward queries: "what changed recently?" or "who owns this file?" RootChain inverts the direction: it starts from a **runtime signal** and walks backward through the SDLC graph to find the causal human decision.
+
+The key multi-hop path:
+```
+AttributeError at runtime
+  → stack frame: _run_with_retry() in orbit_client.py
+  → Orbit: File[orbit_client.py] ← MergeRequest[!342]
+  → Orbit: MergeRequest[!342] → WorkItem[#89: "JSON DSL rewrite"]
+  → Orbit: MergeRequest[!342] ← User[@alice (author), @bob (reviewer)]
+  → Orbit: Definition[_run_with_retry] ← 7 other callers (blast radius)
+```
+
+No individual hop is novel. What's novel is executing all hops automatically from a runtime error and **ranking** the results by a confidence formula that weighs recency, frame depth, and blast radius simultaneously.
 
 ---
 
 ## Architecture
 
-### Mermaid Flow Diagram
-
-```mermaid
-flowchart TD
-    A[Production error fires\nSentry / GitLab / CI / crash] -->|issue created in GitLab| B[GitLab Issue created\nwith stack trace in description]
-    B -->|work_item_created event| C[RootChain Flow activates]
-    C --> D{Already has\nrootchain-analyzed\nlabel?}
-    D -->|Yes| E[Stop — idempotency guard]
-    D -->|No| F[Parse stack trace\nfrom issue description]
-    F --> G{Parseable\nframes found?}
-    G -->|No| H[Post 'no stack trace'\ncomment + label]
-    G -->|Yes — up to 5 frames| I[Query Orbit in parallel\nfor each frame]
-    I --> J[Primary: Definition→File→MR\nquery_graph]
-    J -->|0 results| K[Fallback: File→MR\nquery_graph]
-    K -->|0 results| L[orbit_miss = true]
-    J -->|MRs found| M[Enrich: linked WorkItems\nReviewers + Caller count]
-    K -->|MRs found| M
-    M --> N[Score confidence\nrecency×0.5 + depth×0.35 + blast×0.15]
-    N --> O[Deduplicate by MR iid\nSelect primary suspect]
-    O --> P[Render Markdown\nblame chain comment]
-    P --> Q[create_note on issue]
-    Q --> R[add_label rootchain-analyzed]
-    R --> S[Done — context delivered\nin under 2 minutes]
-```
-
-### High-Level Design (HLD)
-
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              EXTERNAL LAYER                                  │
-│                                                                               │
-│   ┌─────────────┐      native integration      ┌──────────────────────────┐ │
-│   │   Sentry    │ ─────────────────────────────▶│  GitLab Issue Created   │ │
-│   │  (Alerts)   │    (or webhook receiver)      │  label: sentry-alert    │ │
-│   └─────────────┘                               └──────────────┬───────────┘ │
-└──────────────────────────────────────────────────────────────│─────────────┘
-                                                                │
-                                                   work_item_created event
-                                                                │
-┌──────────────────────────────────────────────────────────────▼─────────────┐
 │                        GITLAB DUO AGENT PLATFORM                             │
 │                                                                               │
 │   ┌───────────────────────────────────────────────────────────────────────┐ │
-│   │                    RootChain Flow (rootchain.yml)                      │ │
+│   │                   RootChain Flow  (.gitlab/duo-flows/rootchain.yml)    │ │
 │   │                                                                         │ │
-│   │  ┌──────────────┐    ┌──────────────────┐    ┌─────────────────────┐  │ │
-│   │  │ Sentry Parser│───▶│  Orbit Tracer    │───▶│  Issue Updater      │  │ │
-│   │  │ (AgentComp.) │    │  (AgentComp.)    │    │  (AgentComp.)       │  │ │
-│   │  │              │    │                  │    │                     │  │ │
-│   │  │ · Parse title│    │ · query_graph()  │    │ · Build Markdown    │  │ │
-│   │  │ · Extract    │    │ · Per-frame      │    │ · create_note()     │  │ │
-│   │  │   frames     │    │   symbol lookup  │    │ · add_label()       │  │ │
-│   │  │ · Filter     │    │ · MR traversal   │    │ · @mention author   │  │ │
-│   │  │   libraries  │    │ · Issue links    │    │                     │  │ │
-│   │  └──────────────┘    └────────┬─────────┘    └─────────────────────┘  │ │
-│   │                               │                                          │ │
-│   │           SKILL.md loaded ────┘                                          │ │
+│   │  work_item_created                                                      │ │
+│   │         │                                                               │ │
+│   │         ▼                                                               │ │
+│   │  get_issue ──► parse stack trace ──► query_graph × N frames           │ │
+│   │                                           │                            │ │
+│   │                              File → MR → WorkItem + User + Pipeline   │ │
+│   │                                           │                            │ │
+│   │                              score confidence per frame                │ │
+│   │                                           │                            │ │
+│   │                              create_issue_note + update_issue          │ │
 │   └───────────────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────│─────────────┘
-                                                                │
-┌──────────────────────────────────────────────────────────────▼─────────────┐
-│                          GITLAB ORBIT (Remote)                               │
+└──────────────────────────────────────────────────────────────│──────────────┘
+                                                               │
+┌──────────────────────────────────────────────────────────────▼──────────────┐
+│                          GITLAB ORBIT                                         │
 │                                                                               │
-│  ClickHouse-backed property graph, live-indexed from your GitLab instance   │
-│                                                                               │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐  ┌───────────────┐ │
-│  │  Definition  │  │ MergeRequest │  │   WorkItem    │  │     User      │ │
-│  │  (symbols)   │  │  (MRs/PRs)   │  │  (issues)     │  │  (authors)    │ │
-│  └──────┬───────┘  └──────┬───────┘  └───────────────┘  └───────────────┘ │
-│         │  DEFINED_IN      │  CLOSES / MENTIONS                              │
-│         ▼                  ▼                                                 │
-│  ┌──────────────┐  ┌──────────────┐                                         │
-│  │     File     │  │   WorkItem   │  ◀── N-hop graph traversal queries      │
-│  └──────────────┘  └──────────────┘                                         │
+│   File  ←──MODIFIES_FILE──  MergeRequest  ──CLOSES──►  WorkItem             │
+│    │                              │                                           │
+│   Definition  ←──CALLS──  Definition     ──AUTHORED_BY──►  User             │
+│                                   │                                           │
+│                              Pipeline  ──  Vulnerability                     │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Low-Level Design (LLD)
+The Duo Agent Platform flow is the **only required file**. The Python code in `src/rootchain/` is a standalone fallback orchestrator for orgs that want to run the same analysis outside the Duo Agent Platform context.
 
-#### 1. Trigger & Entry
+---
 
-**Trigger:** `work_item_created` (and optionally `work_item_updated`)
-**Filter:** Optional — configure in AI → Triggers. Leave the label filter empty to run on all issues, or restrict to labels like `bug`, `incident`, `sentry-alert`, `crash`, etc.
-**Context injected into agent:** `project_id` (numeric project ID) and `goal` (issue IID)
+## Quick Start
 
-The agent's very first action is `get_issue` with the project_id and IID to read the full issue.
+### Prerequisites
 
-**Guard check (first thing the agent does):**
+| Requirement | Notes |
+|-------------|-------|
+| GitLab.com Premium or self-managed Ultimate | Required for Orbit Remote |
+| Orbit enabled on your group | Settings → AI & Analytics → Orbit → Enable |
+| GitLab Duo enabled on the project | Project → Settings → GitLab Duo |
+| Personal access token with `api` scope | For Orbit queries and issue updates |
+
+### Step 1: Add the flow to your project
+
+Copy `.gitlab/duo-flows/rootchain.yml` into your project's repository at the same path. That's the entire integration — no server, no cron job, no webhook registration.
+
+```bash
+# From your project root
+mkdir -p .gitlab/duo-flows .gitlab/skills/rootchain
+curl -O https://raw.githubusercontent.com/your-org/rootchain/main/.gitlab/duo-flows/rootchain.yml
+curl -O https://raw.githubusercontent.com/your-org/rootchain/main/.gitlab/skills/rootchain/SKILL.md
+git add .gitlab/ && git commit -m "Add RootChain Duo flow"
+git push
 ```
-IF already has label "rootchain-analyzed" → exit immediately (idempotency)
-IF issue body has no recognizable stack trace → add comment "RootChain: No stack trace detected" → exit
+
+### Step 2: Enable the trigger
+
+In your GitLab project: **AI → Triggers → New flow trigger**
+
+| Field | Value |
+|-------|-------|
+| Event type | Work item → Created |
+| Service account | Select the auto-created service account |
+| Configuration source | rootchain |
+| Label filter | Leave empty (all issues) or set to `bug`, `incident`, etc. |
+
+### Step 3: Enable Orbit on your group
+
+```
+Group → Settings → AI & Analytics → Orbit → Enable
 ```
 
-#### 2. Stack Trace Parsing
+Wait for initial indexing to complete (10–30 minutes for large groups).
 
-The agent parses the GitLab issue description to extract stack frames. The issue may come from:
-- **Sentry** (native GitLab integration): `## ErrorType: msg` heading + `### Stacktrace` section
-- **GitLab error tracking**: similar Sentry-like format
-- **CI pipeline failure**: pasted crash output in issue description
-- **Crash report / manual bug**: any standard traceback pasted into the description
+### Step 4: Verify
 
-Common formats handled:
+Create a test issue with any stack trace in the description. Within 2 minutes, the flow should activate and post a RootChain analysis comment. Check **AI → Flows → Managed → rootchain → Sessions** for the run log.
 
-**Parsing rules per language:**
+---
+
+## Configuration (Python Fallback Orchestrator)
+
+If running outside the Duo Agent Platform, configure via environment variables:
+
+```bash
+# .env.example
+
+# Required
+ROOTCHAIN_GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx   # api scope
+ROOTCHAIN_GITLAB_URL=https://gitlab.com
+ROOTCHAIN_GROUP_PATH=my-org
+ROOTCHAIN_PROJECT_PATH=my-org/my-app
+
+# Orbit
+ROOTCHAIN_ORBIT_TIMEOUT_SECONDS=30
+ROOTCHAIN_ORBIT_MAX_RETRIES=3
+ROOTCHAIN_DEFAULT_BRANCH=main
+
+# Parsing
+ROOTCHAIN_MAX_FRAMES=5
+ROOTCHAIN_INCLUDE_LIBRARY_FRAMES=false
+
+# Confidence scoring (weights must sum to 1.0)
+ROOTCHAIN_CONFIDENCE_THRESHOLD=0.4
+ROOTCHAIN_RECENCY_WEIGHT=0.50
+ROOTCHAIN_DEPTH_WEIGHT=0.35
+ROOTCHAIN_BLAST_WEIGHT=0.15
+ROOTCHAIN_RECENCY_HALF_LIFE_DAYS=30
+
+# Output
+ROOTCHAIN_ADD_LABEL=rootchain-analyzed
+ROOTCHAIN_MENTION_AUTHORS=true
+ROOTCHAIN_MENTION_REVIEWERS=false
+ROOTCHAIN_MAX_MENTION_USERS=3
+
+# Logging
+ROOTCHAIN_LOG_LEVEL=INFO
+ROOTCHAIN_LOG_FORMAT=json          # json | console
+```
+
+Run locally:
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+# Dry run: parse + query Orbit, print the comment to stdout
+python -m src.rootchain.orchestrator \
+  --project-path "my-org/my-app" \
+  --issue-iid 42 \
+  --dry-run
+```
+
+---
+
+## How RootChain Finds the Causal MR
+
+For each stack frame, `OrbitClient` runs a cascade of strategies — stopping at the first one that returns MR nodes:
+
+**Strategy 1 — File neighbors** (direct; fastest when indexed)
+```json
+{"query": {"query_type": "neighbors", "node": {"entity": "File", "filters": {"path": "src/my/file.py"}}, "neighbors": {"node": "n"}}}
+```
+
+**Strategy 2 — MergeRequestDiffFile** (one hop via diff record)
+```json
+{"query": {"query_type": "neighbors", "node": {"entity": "MergeRequestDiffFile", "filters": {"new_path": "src/my/file.py"}}, "neighbors": {"node": "n"}}}
+```
+
+**Strategy 3 — old_path fallback** (renamed files; applies a 0.7× confidence penalty)
+
+**Strategy 4 — GitLab commits REST API** (reliable fallback when Orbit graph edges aren't indexed yet)
+```
+GET /api/v4/projects/{id}/repository/commits?path={file}&ref_name=main
+→ per commit SHA → GET .../commits/{sha}/merge_requests
+→ supplement with Orbit MR node data
+```
+
+Once MRs are found, a single `neighbors` query per MR returns WorkItems, Users, and Pipeline nodes together for enrichment.
+
+### Confidence Scoring
+
+```
+recency  = 1 / (1 + days_since_merge / 30)   # 0 days → 1.0, 30 days → 0.5
+depth    = 1 / frame_depth                    # frame 1 → 1.0, frame 5 → 0.2
+blast    = min(caller_count / 10, 1.0)        # callers via Orbit CALLS edges
+
+confidence = (recency × 0.50) + (depth × 0.35) + (blast × 0.15)
+
+# orbit_miss → 0.0  (no data; never fabricate)
+# fallback_used → × 0.7  (file-level match is less precise)
+```
+
+**≥ 0.7** → 🔴 HIGH · **0.4–0.69** → 🟡 MEDIUM · **< 0.4** → 🟢 LOW
+
+---
+
+## Supported Languages
 
 | Language | Frame pattern | Library detection |
 |----------|--------------|-------------------|
-| Python | `File "path", line N, in func` | `site-packages/`, `/usr/lib/` |
-| Node.js | `at FuncName (file.js:N:C)` | `node_modules/` |
-| Go | `goroutine N [...]\npackage.Func(...)` | `runtime/`, `vendor/` |
-| Ruby | `path:N:in 'method'` | `gems/`, `/usr/` |
-| Java | `at class.method(File.java:N)` | `java.`, `sun.`, `com.google.` |
-| Kotlin | Same JVM format as Java; `.kt` extension triggers Kotlin detection | Same as Java plus `kotlin.`, `kotlinx.` |
-| Rust | Two-line: `N: func::path` then `  at file.rs:N`; also `thread 'x' panicked at` | `std::`, `core::`, `alloc::`, `tokio::`, `hyper::`, `actix_` |
-
-**Frame filtering (in order):**
-1. Remove frames matching library path patterns
-2. Remove frames where `function_name` is empty, `<anonymous>`, `<module>`, or `main`
-3. Remove frames whose `file_path` starts with `/` and doesn't match any known project prefix
-4. Take the top 5 remaining frames (closest to the error source first)
-5. If 0 frames survive: add a comment explaining why and mention source maps for JS
-
-#### 3. Orbit Graph Traversal
-
-For each surviving frame, `OrbitClient` (and the Duo Agent Platform flow via `query_graph`)
-queries Orbit using the **JSON DSL** at `POST /api/v4/orbit/query`. Orbit does **not** accept
-Cypher strings — all queries are JSON objects with `query_type`, `node`, `neighbors`, and
-`limit` fields.
-
-**Multi-strategy MR discovery — cascade, stop at first hit:**
-
-**Strategy 1 — File neighbors** (direct; when Orbit has File→MR edges indexed):
-```json
-{
-  "query": {
-    "query_type": "neighbors",
-    "node": {"id": "n", "entity": "File", "filters": {"path": "<file_path>"}},
-    "neighbors": {"node": "n"}
-  }
-}
-```
-Filter response for `type == "MergeRequest"` nodes where `merged_at` is present
-or `state == "merged"`.
-
-**Strategy 2 — MergeRequestDiffFile neighbors** (one hop via diff record):
-```json
-{
-  "query": {
-    "query_type": "neighbors",
-    "node": {"id": "n", "entity": "MergeRequestDiffFile", "filters": {"new_path": "<file_path>"}},
-    "neighbors": {"node": "n"}
-  }
-}
-```
-
-**Strategy 3 — old_path fallback** (renamed files; sets `fallback_used=True`, confidence ×0.7):
-Same JSON as Strategy 2 but `"old_path"` instead of `"new_path"`.
-
-**Strategy 4 — GitLab commits REST API** (reliable fallback when Orbit graph edges aren't yet indexed):
-```
-GET /api/v4/projects/{project_path}/repository/commits?path={file_path}&ref_name=main
-→ for each commit SHA:
-GET /api/v4/projects/{project_path}/repository/commits/{sha}/merge_requests
-→ collect merged MR iids → enrich each via Orbit traversal(MergeRequest, {iid: N})
-```
-REST API fields (`merged_at`, `web_url`, `author`) supplement any Orbit MR node
-fields that are absent. This strategy reliably bridges the gap while the Orbit
-graph is still building its edge index for recently-merged files.
-
-If all strategies return 0 MRs: mark frame as `orbit_miss`.
-
-**MR enrichment — one query per found MR** (returns WorkItems, Users, Pipelines together):
-```json
-{
-  "query": {
-    "query_type": "neighbors",
-    "node": {"id": "n", "entity": "MergeRequest", "filters": {"iid": <mr_iid>}},
-    "neighbors": {"node": "n"}
-  }
-}
-```
-Filter by `type`: `"WorkItem"` → linked issues · `"User"` → reviewers · `"Pipeline"` → CI status.
-
-**Blast radius** (caller count, used in confidence formula):
-```json
-{
-  "query": {
-    "query_type": "neighbors",
-    "node": {"id": "n", "entity": "Definition", "filters": {"name": "<function_name>"}},
-    "neighbors": {"node": "n"}
-  }
-}
-```
-Count neighbor nodes of `type == "Definition"` with a different `name` value.
-
-**Query execution strategy:**
-- Run all frame queries in parallel via `asyncio.gather()`, not sequentially
-- Cache results by `(function_name, file_path)` within a single run
-- Timeout per query: 30 seconds. Retry: 3× with 2s, 4s, 8s backoff (tenacity).
-- On HTTP 400 (unsupported filter field): return empty list, do not retry.
-- On HTTP 429: respect `Retry-After` header before retrying.
-
-#### 4. Blame Chain Construction
-
-After Orbit returns results for all frames, the agent builds a ranked blame chain.
-
-**Confidence score formula per frame:**
-
-```
-recency_score    = 1.0 / (1 + days_since_merge / 30)   # 0–1, decays over time
-depth_score      = 1.0 / frame_depth                    # frame 1 = 1.0, frame 5 = 0.2
-blast_score      = min(caller_count / 10, 1.0)          # more callers = more likely to matter
-orbit_coverage   = 0.0 if orbit_miss else 1.0
-
-confidence = (recency_score * 0.5 + depth_score * 0.35 + blast_score * 0.15) * orbit_coverage
-```
-
-**Primary suspect:** the frame/MR with the highest confidence score.
-
-**Confidence thresholds:**
-- `≥ 0.7`: HIGH — "Very likely introduced by..."
-- `0.4–0.69`: MEDIUM — "May have been affected by..."
-- `< 0.4`: LOW — "Historically modified by..."
-
-#### 5. Issue Update
-
-The agent posts a new **comment** (note) on the issue — it does NOT modify the original description (Sentry keeps updating it). It also applies the `rootchain-analyzed` label.
-
-**Comment format:**
-```markdown
-## 🔗 RootChain SDLC Blame Analysis
-
-**Analyzed:** {timestamp} UTC  
-**Error:** `{error_type}: {error_message}`  
-**Frames analyzed:** {n} (filtered from {total} total)  
-**Primary suspect:** [MR !{iid}]({url}) by @{author} · {N} days ago
+| Python | `File "path", line N, in func` | `site-packages/`, `/usr/lib/`, `.pyenv/` |
+| Node.js / TypeScript | `at FuncName (file.js:N:C)` | `node_modules/`, `dist/` |
+| Go | goroutine header + `package.Func(...)\n  /path/file.go:N` | `/usr/local/go/`, `runtime/`, `vendor/` |
+| Ruby | `path:N:in 'method'` | `gems/`, `rubygems/` |
+| Java | `at com.pkg.Class.method(File.java:N)` | `java.`, `javax.`, `sun.`, `org.springframework.` |
+| Kotlin | Same JVM format; `.kt` extension triggers Kotlin detection | `kotlin.`, `kotlinx.` |
+| Rust | `N: func::path\n  at file.rs:N` + panic format | `std::`, `core::`, `alloc::`, `tokio::` |
 
 ---
 
-### Stack Trace → SDLC Chain
+## Edge Cases
 
-| # | Function | File | Last MR | Intent | Author | Confidence |
-|---|----------|------|---------|--------|--------|------------|
-| 1 | `processPayment` | payments/processor.py:142 | [!342]({url}) · 4d ago | [#89: Add retry logic]({url}) | @alice | 🔴 HIGH |
-| 2 | `call_gateway` | payments/gateway.py:88 | [!318]({url}) · 3w ago | [#74: Refactor gateway]({url}) | @bob | 🟡 MEDIUM |
-| 3 | `post` | core/session.py:34 | [!201]({url}) · 2mo ago | [#41: Session pooling]({url}) | @carol | 🟢 LOW |
-
----
-
-### Analysis
-
-MR !342 introduced retry logic in `processPayment()` to close issue #89. The 
-change adds a retry branch for failed gateway calls. Based on the TypeError 
-(`'id' of undefined`), the retry response path may return a different structure 
-than the success path, and `gateway_response['id']` is accessed without a null 
-check on the retry code path.
-
-**Suggested investigation:** Review `payments/processor.py` around line 142, 
-specifically the retry branch added in [MR !342]({url}). Check whether 
-`gateway_response` can be `null` or `undefined` on retry exhaustion.
-
-**Loop in:** @alice (MR author) · @dave (MR reviewer)
+| Situation | Handling |
+|-----------|----------|
+| Issue already analyzed | `rootchain-analyzed` label check exits immediately (idempotency) |
+| No recognizable stack trace | Posts "no stack trace found" comment, adds label, stops |
+| All frames are library code | Posts "all frames filtered" comment explaining why |
+| `orbit_miss` for all frames | Posts full analysis table with "Not in Orbit index" in each row |
+| Orbit returns `{"result": null}` | Treated as empty result — never raises AttributeError |
+| Same MR in multiple frames | Deduplicates — appears once with the highest confidence score |
+| Stack trace is 50+ frames | Takes top 5 non-library frames, notes how many were omitted |
+| Minified JS / no function names | Skips `<anonymous>` frames, notes source maps recommendation |
+| Java `Caused by:` chain | Parses root cause block first; traces all exception layers |
+| Renamed file (old_path) | Strategy 3 catches it with a 0.7× confidence penalty |
+| Orbit not yet indexed (~1h after merge) | Strategy 4 (commits REST API) bridges the gap |
 
 ---
 
-<sub>Generated by [RootChain](https://gitlab.com/{your-group}/rootchain) · 
-[Disable for this project](link) · [Report false positive](link)</sub>
-```
+## FAQ
 
-#### 6. Data Models
+**Q: Does this require Sentry?**  
+No. Any GitLab issue with a stack trace in the description works — GitLab error tracking, CI failures, crash reports, manual bug reports, all equally.
 
-```python
-# All models use Pydantic v2
+**Q: Does it work with GitLab self-managed?**  
+Yes, if Orbit Remote is enabled (requires Ultimate tier with ClickHouse backend). Set `ROOTCHAIN_GITLAB_URL` to your instance URL.
 
-class Language(str, Enum):
-    PYTHON = "python"
-    JAVASCRIPT = "javascript"
-    GO = "go"
-    RUBY = "ruby"
-    JAVA = "java"
-    UNKNOWN = "unknown"
+**Q: What if the MR has no linked issues?**  
+The MR title and author are shown. RootChain never fabricates intent.
 
-class StackFrame(BaseModel):
-    file_path: str
-    function_name: str
-    line_number: int
-    language: Language
-    is_library: bool
-    frame_depth: int          # 1 = closest to error
-    raw_line: str
+**Q: Can I restrict which issues trigger it?**  
+Set a label filter in the trigger configuration (AI → Triggers). Common filters: `bug`, `incident`, `sentry-alert`.
 
-class SentryEvent(BaseModel):
-    error_type: str
-    error_message: str
-    culprit: str | None
-    environment: str | None
-    frames: list[StackFrame]
-    sentry_issue_url: str | None
-    
-class MRContext(BaseModel):
-    iid: int
-    title: str
-    description: str
-    author_username: str
-    merged_at: datetime | None
-    web_url: str
-    linked_issues: list[LinkedIssue]
-    reviewers: list[str]
-    days_since_merge: int
+**Q: How do I tune for a monorepo?**  
+Set `ROOTCHAIN_GROUP_PATH` to the top-level group. Orbit indexes the entire group, so all projects in the monorepo are covered automatically.
 
-class LinkedIssue(BaseModel):
-    iid: int
-    title: str
-    web_url: str
-    state: str  # opened | closed
-
-class SymbolHistory(BaseModel):
-    function_name: str
-    file_path: str
-    recent_mrs: list[MRContext]
-    caller_count: int
-    orbit_miss: bool          # True if Orbit returned no results
-    fallback_used: bool       # True if file-level fallback was used
-
-class BlameEntry(BaseModel):
-    frame: StackFrame
-    history: SymbolHistory
-    primary_mr: MRContext | None  # most recent MR
-    confidence: float
-    confidence_label: Literal["HIGH", "MEDIUM", "LOW"]
-    confidence_reason: str
-
-class BlameChain(BaseModel):
-    entries: list[BlameEntry]
-    primary_suspect: BlameEntry | None
-    frames_analyzed: int
-    frames_total: int
-    orbit_misses: int
-    generated_at: datetime
-```
-
-#### 7. Orbit API Response Handling
-
-The Orbit REST API returns a graph result object. The actual response shape (verified against
-the live GitLab.com Orbit API):
-
-```json
-{
-  "result": {
-    "nodes": [
-      {
-        "id": "mr:1",
-        "type": "MergeRequest",
-        "iid": 1,
-        "title": "Add retry logic",
-        "state": "merged",
-        "merged_at": "2024-01-11T14:23:00Z",
-        "author_username": "alice"
-      },
-      {
-        "id": "wi:2",
-        "type": "WorkItem",
-        "iid": 2,
-        "title": "Orbit client sends wrong query format",
-        "state": "opened"
-      }
-    ],
-    "edges": []
-  }
-}
-```
-
-**Critical normalisation rules:**
-- Top-level key is `"result"`, **not** `"data"`. Access: `body["result"]["nodes"]`.
-- Node properties are **flat** on the node object — there is **no** `"properties"` sub-dict.
-- If `"result"` is absent or `"error"` key is present at the top level: treat as `orbit_miss`.
-- `merged_at` and `web_url` may be absent on `MergeRequest` nodes from traversal queries.
-  If `web_url` is missing: construct `{gitlab_url}/{project_path}/-/merge_requests/{iid}`.
-  If `merged_at` is missing but `state == "merged"`: use the REST commits API to get `merged_at`.
-- `iid` can be returned as a string from ClickHouse — always cast to `int`.
-- HTTP 400 means an unsupported filter field was used (Orbit has an allowlist). Return `[]`,
-  do not retry. HTTP 5xx and network errors are retried up to 3× with exponential backoff.
-
-#### 8. GitLab Issue Update
-
-Use the GitLab REST API to add a comment:
-
-```
-POST /api/v4/projects/{project_id}/issues/{issue_iid}/notes
-{
-  "body": "{rendered_markdown}"
-}
-```
-
-Then add the `rootchain-analyzed` label:
-
-```
-PUT /api/v4/projects/{project_id}/issues/{issue_iid}
-{
-  "add_labels": "rootchain-analyzed"
-}
-```
-
-Both calls use `ROOTCHAIN_GITLAB_TOKEN` (needs `api` scope).
-
----
-
-## Tech Stack
-
-| Layer | Technology | Why |
-|-------|-----------|-----|
-| Agent Platform | GitLab Duo Agent Platform | Required by hackathon; native Orbit integration |
-| Knowledge Graph | GitLab Orbit (Remote) | SDLC graph traversal across MRs, issues, users, symbols |
-| Error Tracking | Sentry | Ubiquitous; native GitLab integration creates issues automatically |
-| Language | Python 3.11+ | Async-native, excellent httpx + Pydantic ecosystem |
-| HTTP Client | httpx | Async-first, built-in retry, proper connection pooling |
-| Data Validation | Pydantic v2 | Model validation, JSON parsing, serialization |
-| Retries | tenacity | Declarative retry/backoff without boilerplate |
-| Logging | structlog | Structured JSON logs, easy to forward to any sink |
-| Testing | pytest + pytest-asyncio | Async test support |
-| CI | GitLab CI/CD | Self-hosted validation pipeline |
-| Optional receiver | FastAPI | Fallback webhook receiver if native Sentry integration unavailable |
-
----
-
-## Project Structure
-
-```
-rootchain/
-│
-├── README.md                              ← You are here
-├── CLAUDE.md                              ← Instructions for Claude Code
-├── AGENTS.md                              ← Instructions for any AI agent
-├── LICENSE                                ← MIT
-│
-├── .gitlab/
-│   ├── duo-flows/
-│   │   └── rootchain.yml                 ← Duo Agent Platform flow definition (PRIMARY ARTIFACT)
-│   └── skills/
-│       └── rootchain/
-│           └── SKILL.md                  ← Agent skill: parsing + Orbit interpretation rules
-│
-├── .gitlab-ci.yml                         ← CI: lint, test, validate flow YAML, integration smoke test
-│
-├── src/
-│   └── rootchain/
-│       ├── __init__.py
-│       ├── config.py                      ← Config loading (env vars → Config dataclass)
-│       ├── models.py                      ← All Pydantic models (single source of truth)
-│       ├── sentry_parser.py               ← Parse stack traces from issue descriptions
-│       ├── orbit_client.py                ← Orbit REST API client (queries, retries, caching)
-│       ├── blame_chain.py                 ← Confidence scoring + blame chain construction
-│       ├── issue_formatter.py             ← Render BlameChain → Markdown comment
-│       ├── gitlab_client.py               ← GitLab API client (notes, labels)
-│       └── orchestrator.py               ← Entry point: wire everything together
-│
-├── receiver/                              ← OPTIONAL: fallback webhook receiver
-│   ├── main.py                            ← FastAPI app
-│   ├── requirements.txt
-│   ├── Dockerfile
-│   └── fly.toml                           ← Deploy to Fly.io (free tier)
-│
-├── scripts/
-│   ├── validate_flow.py                   ← Validate rootchain.yml against Duo Platform schema
-│   ├── test_orbit_connection.py           ← Smoke test: verify Orbit is reachable + enabled
-│   └── generate_test_issue.py            ← Create a test Sentry-format issue in GitLab (for demo)
-│
-├── tests/
-│   ├── conftest.py                        ← Fixtures: mock Orbit responses, sample Sentry events
-│   ├── fixtures/
-│   │   ├── sentry_python.json            ← Python Sentry event payload
-│   │   ├── sentry_node.json              ← Node.js Sentry event payload
-│   │   ├── sentry_go.json                ← Go Sentry event payload
-│   │   ├── sentry_minified_js.json       ← Minified JS (edge case: no readable frames)
-│   │   ├── orbit_response_full.json      ← Full Orbit API response with MR + issues + users
-│   │   ├── orbit_response_empty.json     ← Orbit returns no results (orbit_miss case)
-│   │   └── gitlab_issue_sentry.json      ← Sample GitLab issue created by Sentry integration
-│   ├── unit/
-│   │   ├── test_sentry_parser.py
-│   │   ├── test_orbit_client.py
-│   │   ├── test_blame_chain.py
-│   │   └── test_issue_formatter.py
-│   └── integration/
-│       └── test_orchestrator.py          ← Requires ROOTCHAIN_ORBIT_TOKEN + test project
-│
-├── docs/
-│   ├── configuration.md                  ← All env vars explained
-│   ├── orbit_queries.md                  ← All Cypher queries with examples
-│   ├── sentry_setup.md                   ← Step-by-step Sentry integration guide
-│   ├── ai_catalog_publish.md             ← How to publish to GitLab AI Catalog
-│   └── troubleshooting.md               ← Common errors + fixes
-│
-└── pyproject.toml                         ← Project metadata, deps, ruff config, pytest config
-```
-
----
-
-## Prerequisites
-
-Before you start, ensure you have:
-
-| Requirement | Minimum Version | Purpose |
-|-------------|----------------|---------|
-| Python | 3.11+ | Runtime |
-| `glab` CLI | Latest | GitLab CLI for local Orbit testing |
-| GitLab tier | **GitLab.com Premium** or self-managed Ultimate | Orbit Remote requires ClickHouse backend |
-| GitLab Orbit | Enabled on group | Core data source |
-| GitLab Duo | Enabled for the project | Agent Platform prerequisite |
-| Sentry | Any plan | Error source (self-hosted works too) |
-| Access token | `api` scope | Both Orbit queries and issue updates |
-
-**Check Orbit is available:**
-```bash
-curl -s \
-  --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-  "https://gitlab.com/api/v4/orbit/status" \
-| jq '.status'
-# Should return "healthy"
-```
-
-**Check Orbit is enabled on your group:**
-```bash
-curl -s \
-  --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
-  "https://gitlab.com/api/v4/groups/{group_id}/orbit/status" \
-| jq '.indexing_status'
-# Should return "indexed" or "indexing"
-```
-
----
-
-## Installation & Setup
-
-### Step 1: Fork and clone this repository
-
-```bash
-git clone https://gitlab.com/YOUR_USERNAME/rootchain.git
-cd rootchain
-```
-
-### Step 2: Install Python dependencies
-
-```bash
-python -m venv .venv
-source .venv/bin/activate           # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
-```
-
-### Step 3: Enable GitLab Orbit on your group
-
-1. Go to **your-group → Settings → AI & Analytics → Orbit**
-2. Enable Orbit indexing
-3. Wait for initial indexing to complete (can take 10–30 minutes for large groups)
-4. Verify: `python scripts/test_orbit_connection.py`
-
-### Step 4: Configure GitLab CI/CD variables
-
-In your forked project, go to **Settings → CI/CD → Variables** and add:
-
-| Variable | Value | Masked | Protected |
-|----------|-------|--------|-----------|
-| `ROOTCHAIN_GITLAB_TOKEN` | A PAT with `api` scope | ✅ | ✅ |
-| `ROOTCHAIN_GITLAB_URL` | `https://gitlab.com` (or your self-managed URL) | ❌ | ❌ |
-| `ROOTCHAIN_GROUP_PATH` | `your-group` (top-level group with Orbit enabled) | ❌ | ❌ |
-| `ROOTCHAIN_PROJECT_PATH` | `your-group/your-project` (where Sentry issues land) | ❌ | ❌ |
-| `ROOTCHAIN_ORBIT_TIMEOUT_SECONDS` | `30` | ❌ | ❌ |
-| `ROOTCHAIN_MAX_FRAMES` | `5` | ❌ | ❌ |
-| `ROOTCHAIN_CONFIDENCE_THRESHOLD` | `0.4` | ❌ | ❌ |
-
-### Step 5: Configure the Duo Agent Platform flow
-
-The flow is defined in `.gitlab/duo-flows/rootchain.yml`. It is automatically picked up by the Duo Agent Platform when present in the project. No additional registration step is required.
-
-Verify the flow is recognized:
-1. Go to **your-project → AI → Flows → Managed tab**
-2. You should see `rootchain` listed there
-   (The "Enabled" tab shows only GitLab-provided flows — your custom flow is under "Managed")
-3. Click into it to confirm the YAML loaded correctly
-
-### Step 6: Connect your error source (optional — any will work)
-
-RootChain activates on any `work_item_created` event, so any system that creates GitLab issues automatically qualifies. No specific integration is required.
-
-**Option A — Sentry native integration:**
-1. In Sentry: **Settings → Integrations → GitLab** → connect and configure issue creation
-2. Set labels on the Sentry alert rule (e.g., `sentry-alert`) if using a label-filtered trigger
-3. Sentry creates issues with title `[Sentry] ErrorType: message` — RootChain parses these automatically
-
-**Option B — GitLab error tracking:**
-GitLab's built-in error tracking creates issues in the same format. No extra setup needed.
-
-**Option C — Manual or scripted issue creation:**
-Any issue with a stack trace pasted in the description works. Create a test issue manually:
-```bash
-python scripts/generate_test_issue.py \
-  --project-path "your-group/your-project" \
-  --token "$ROOTCHAIN_GITLAB_TOKEN"
-```
-
-**Option D — Webhook receiver (custom integration):**
-Deploy `receiver/main.py` to receive webhooks from any alert system and translate them to GitLab issues:
-```bash
-cd receiver/
-flyctl deploy
-```
-
-### Step 7: Verify end-to-end
-
-Run the test issue generator to simulate a Sentry alert:
-```bash
-python scripts/generate_test_issue.py \
-  --project-path "your-group/your-project" \
-  --token "$ROOTCHAIN_GITLAB_TOKEN"
-```
-
-This creates a GitLab issue with a realistic Sentry format. Within ~2 minutes, the flow should activate and post a RootChain analysis comment.
-
----
-
-## Configuration Reference
-
-All configuration is driven by environment variables. A local `.env` file is supported for development (never commit this file).
-
-```bash
-# .env.example — copy to .env and fill in
-
-# ── Required ────────────────────────────────────────────────────────
-ROOTCHAIN_GITLAB_TOKEN=glpat-xxxxxxxxxxxxxxxxxxxx   # PAT: api scope
-ROOTCHAIN_GITLAB_URL=https://gitlab.com             # Base URL
-ROOTCHAIN_GROUP_PATH=my-org                         # Top-level group with Orbit
-ROOTCHAIN_PROJECT_PATH=my-org/my-app                # Target project for issue updates
-
-# ── Orbit ───────────────────────────────────────────────────────────
-ROOTCHAIN_ORBIT_TIMEOUT_SECONDS=30    # Per-query timeout (int, 5–120)
-ROOTCHAIN_ORBIT_MAX_RETRIES=3         # Retry attempts on timeout/5xx
-ROOTCHAIN_ORBIT_RETRY_BASE_SECONDS=2  # Exponential backoff base
-
-# ── Parsing ─────────────────────────────────────────────────────────
-ROOTCHAIN_MAX_FRAMES=5                # Max frames to analyze (int, 1–10)
-ROOTCHAIN_INCLUDE_LIBRARY_FRAMES=false  # Include library frames (bool)
-
-# ── Scoring ─────────────────────────────────────────────────────────
-ROOTCHAIN_CONFIDENCE_THRESHOLD=0.4   # Min confidence to show in output (float, 0–1)
-ROOTCHAIN_RECENCY_WEIGHT=0.5         # Weight of recency in confidence (float)
-ROOTCHAIN_DEPTH_WEIGHT=0.35          # Weight of frame depth in confidence (float)
-ROOTCHAIN_BLAST_WEIGHT=0.15          # Weight of caller count in confidence (float)
-ROOTCHAIN_RECENCY_HALF_LIFE_DAYS=30  # Days until recency score halves (int)
-
-# ── Output ──────────────────────────────────────────────────────────
-ROOTCHAIN_ADD_LABEL=rootchain-analyzed          # Label to add after analysis
-ROOTCHAIN_MENTION_AUTHORS=true                  # @mention MR authors in comment
-ROOTCHAIN_MENTION_REVIEWERS=false               # @mention reviewers (can be noisy)
-ROOTCHAIN_MAX_MENTION_USERS=3                   # Max users to @mention
-
-# ── Webhook Receiver (Option B only) ────────────────────────────────
-ROOTCHAIN_WEBHOOK_SECRET=your-secret-here       # HMAC secret for Sentry webhook
-ROOTCHAIN_WEBHOOK_PORT=8080
-
-# ── Logging ─────────────────────────────────────────────────────────
-ROOTCHAIN_LOG_LEVEL=INFO           # DEBUG | INFO | WARNING | ERROR
-ROOTCHAIN_LOG_FORMAT=json          # json | console (use console for local dev)
-```
-
----
-
-## GitLab Duo Agent Platform Flow
-
-### Flow Definition (`.gitlab/duo-flows/rootchain.yml`)
-
-The flow uses the GitLab Duo Agent Platform v1 schema. Key structure:
-
-```yaml
-version: "v1"
-environment: ambient
-
-components:
-  - name: "parse_and_trace"
-    type: AgentComponent
-    prompt_id: "rootchain_prompt"
-    inputs:
-      - "context:goal"        # work item IID, available as {{goal}} in prompts
-      - "context:project_id"  # numeric project ID, available as {{project_id}}
-    toolset:
-      - get_issue
-      - query_graph
-      - create_note
-      - add_label
-
-prompts:
-  - prompt_id: "rootchain_prompt"
-    # ... system prompt with all 8 steps + two critical rules ...
-    unit_primitives: []
-    params:
-      timeout: 180
-
-routers:
-  - from: "parse_and_trace"
-    to: "end"
-
-flow:
-  entry_point: "parse_and_trace"
-```
-
-See `.gitlab/duo-flows/rootchain.yml` for the complete flow definition.
-
-### Key Flow Design Decisions
-
-**Why `work_item_created` and not a pipeline trigger?**  
-Sentry's native GitLab integration already creates issues. Using `work_item_created` requires zero additional infrastructure. A pipeline trigger would require a receiver service and adds a network hop.
-
-**Why label filtering instead of title-only filtering?**  
-Labels are set programmatically by Sentry and are reliable. Title patterns are a fallback for orgs that configure Sentry without standard labels. Using `any_of` catches both.
-
-**Why the idempotency guard?**  
-Sentry sometimes re-fires the same alert if an issue is reopened. The label check ensures the flow runs exactly once per issue, regardless of Sentry's behavior.
-
-**Why `max_iterations: 30`?**  
-Each `query_graph` call is one iteration. Per frame: up to 4 queries (File neighbors, MergeRequestDiffFile neighbors, MR enrichment, Vulnerability traversal) × 5 frames = 20 queries, plus blast-radius neighbors per frame = ~25 total. 30 gives a comfortable buffer for retries and the enrichment calls.
-
----
-
-## Orbit Integration
-
-### Enabling Orbit on your group
-
-```bash
-# Via GitLab API
-curl --request POST \
-  --header "PRIVATE-TOKEN: $ROOTCHAIN_GITLAB_TOKEN" \
-  --header "Content-Type: application/json" \
-  --data '{"enabled": true}' \
-  "https://gitlab.com/api/v4/groups/YOUR_GROUP_ID/orbit/settings"
-```
-
-### Orbit API Endpoint
-
-All Orbit queries go to:
-```
-POST https://gitlab.com/api/v4/orbit/query
-Content-Type: application/json
-PRIVATE-TOKEN: {token}
-```
-
-Orbit uses a **JSON DSL** — **not** Cypher strings. The request body is always a JSON
-object with a `"query"` key containing `query_type`, `node`, and optional `neighbors`/`limit`:
-
-```json
-{
-  "query": {
-    "query_type": "traversal",
-    "node": {"id": "n", "entity": "File", "filters": {"path": "src/my/file.py"}},
-    "limit": 5
-  }
-}
-```
-
-Supported `query_type` values: `"traversal"`, `"neighbors"`, `"aggregation"`, `"path_finding"`.
-
-**Never** string-interpolate user-supplied values into the JSON payload — always pass them
-as typed values in the `"filters"` object. This prevents injection and avoids 400 errors
-from Orbit's strict filter-key allowlist.
-
-### Orbit Schema Reference
-
-Verify the live schema for your instance:
-```bash
-curl -s \
-  --header "PRIVATE-TOKEN: $ROOTCHAIN_GITLAB_TOKEN" \
-  "https://gitlab.com/api/v4/orbit/schema" \
-  | jq '.domains'
-```
-
-**Key node types:**
-
-| Domain | Node | Key properties |
-|--------|------|----------------|
-| `source_code` | `Definition` | `name`, `kind` (function/class/method), `file_path`, `line_start` |
-| `source_code` | `File` | `path`, `language`, `project_full_path` |
-| `source_code` | `ImportedSymbol` | `name`, `source_path` |
-| `code_review` | `MergeRequest` | `iid`, `title`, `description`, `author_username`, `merged_at`, `web_url`, `project_full_path` |
-| `code_review` | `MergeRequestDiffFile` | `old_path`, `new_path`, `change_type` |
-| `plan` | `WorkItem` | `iid`, `title`, `description`, `state`, `web_url` |
-| `core` | `User` | `username`, `name`, `web_url` |
-| `ci` | `Pipeline` | `id`, `status`, `ref`, `created_at` |
-| `ci` | `Job` | `name`, `status`, `stage`, `duration` |
-| `security` | `Vulnerability` | `name`, `severity`, `state`, `report_type` |
-
-**Key edge types:**
-
-| Edge | From → To | Meaning |
-|------|-----------|---------|
-| `DEFINED_IN` | Definition → File | Symbol defined in file |
-| `CALLS` | Definition → Definition | Function calls function |
-| `MODIFIES_FILE` | MergeRequest → File | MR changed this file |
-| `AUTHORED_BY` | MergeRequest → User | MR author |
-| `REVIEWED_BY` | User → MergeRequest | User reviewed MR |
-| `CLOSES` | MergeRequest → WorkItem | MR closes issue |
-| `MENTIONS` | MergeRequest → WorkItem | MR mentions issue |
-| `IMPORTS` | File → ImportedSymbol | File imports symbol |
-
-### All Orbit Queries Used by RootChain
-
-All query shapes are documented inline in the LLD section above and in `src/rootchain/orbit_client.py`.
-The five strategies in `_find_mrs_for_file()` cover the full cascade from direct File neighbors
-to the commits REST API fallback.
-
----
-
-## Sentry Integration
-
-### What Sentry's native GitLab integration creates
-
-When you configure Sentry → GitLab issue creation, a new GitLab issue is created with:
-
-```
-Title:       [Sentry] TypeError: Cannot read property 'id' of undefined
-Labels:      Sentry (added by Sentry integration)
-Description: (see below)
-```
-
-```markdown
-## TypeError: Cannot read property 'id' of undefined
-
-**Sentry Issue:** https://sentry.io/organizations/your-org/issues/1234567/
-
-**Culprit:** `payments/processor.py in processPayment`
-
-**Times seen:** 47  
-**Users affected:** 12  
-**Environment:** production  
-**First seen:** 2024-01-15T02:14:37Z  
-**Last seen:** 2024-01-15T02:47:12Z  
-
-### Stacktrace
-
-```
-Traceback (most recent call last):
-  File "/app/payments/processor.py", line 142, in processPayment
-    result_id = gateway_response['id']
-  File "/app/payments/gateway.py", line 88, in call_gateway
-    return self._session.post(url, data=payload)
-  File "/app/core/session.py", line 34, in post
-    return requests.post(self.base_url + path, **kwargs)
-  File "/usr/local/lib/python3.11/site-packages/requests/api.py", line 73, in post
-    return request('post', url, data=data, json=json, **kwargs)
-```
-```
-
-**This format is stable** — parse with `SentryParser.parse_from_issue_description()`.
-
-### Adding the `sentry-alert` label automatically
-
-In your GitLab project: **Settings → Labels** → Create label `sentry-alert` (color: red).
-
-Then: **Settings → Integrations → Pipeline status emails** (or use label events) to auto-add `sentry-alert` whenever label `Sentry` is added. Alternatively, configure Sentry to add `sentry-alert` directly in its GitLab integration settings under "Additional labels".
-
-### Webhook Receiver (Option B)
-
-If you can't use native integration, deploy `receiver/main.py`:
-
-```python
-# receiver/main.py structure
-POST /webhook/sentry
-  → validate HMAC signature (X-Sentry-Hook-Signature header)
-  → parse SentryWebhookPayload
-  → extract: event.type, event.culprit, event.title, stacktrace
-  → create GitLab issue via API with Sentry data in description
-  → add labels: sentry-alert, Sentry
-  → return 200 OK
-
-GET /health
-  → return {"status": "ok", "version": "..."}
-```
-
----
-
-## Blame Chain Algorithm
-
-### Confidence Score
-
-Each blame entry is scored 0.0–1.0:
-
-```
-recency  = 1 / (1 + days_since_merge / HALF_LIFE_DAYS)
-           # 0 days → 1.0, 30 days → 0.5, 90 days → 0.25
-
-depth    = 1 / frame_depth
-           # frame 1 (closest to error) → 1.0, frame 5 → 0.2
-
-blast    = min(caller_count / 10.0, 1.0)
-           # 0 callers → 0.0, 5 callers → 0.5, 10+ callers → 1.0
-
-confidence = (recency × W_RECENCY) + (depth × W_DEPTH) + (blast × W_BLAST)
-           # Weights configurable via env vars, default: 0.5 / 0.35 / 0.15
-
-# If orbit_miss is True: confidence = 0.0 (we have no data, don't guess)
-# If fallback_used is True: multiply by 0.7 (file-level match is less precise)
-```
-
-### Why these weights?
-
-- **Recency (50%):** A change from 4 days ago is far more likely to cause a new error than one from 6 months ago. Weighted highest.
-- **Frame depth (35%):** The error throws in frame 1. Frame 1's last modifier is more likely culpable than frame 5's.
-- **Caller count (15%):** High caller count means the function is critical, but it also means many MRs have touched it. Lower weight because it's a signal of importance, not causation.
-
-### Primary Suspect Selection
-
-The `primary_suspect` is the `BlameEntry` with the highest `confidence` score AND `confidence >= ROOTCHAIN_CONFIDENCE_THRESHOLD`. If no entry meets the threshold, `primary_suspect` is `None` and the comment note reads "RootChain could not identify a primary suspect with sufficient confidence."
-
-### Comment on Idempotency in Scoring
-
-If two frames point to the same MR (the MR touched multiple files in the stack), their entries are **merged** — the MR appears once with the maximum confidence across its frames. This prevents the same MR from appearing twice in the blame table.
-
----
-
-## Edge Cases & Handling
-
-| Edge Case | Detection | Handling |
-|-----------|-----------|----------|
-| **Issue already analyzed** | Label `rootchain-analyzed` present | Exit immediately, no comment added |
-| **No stack trace in issue** | `SentryParser` returns `None` | Comment: "No parseable stack trace found." + label applied |
-| **All frames are library code** | 0 frames after filtering | Comment: "All frames are library code. Enable source maps or check filter config." |
-| **Minified JS (no function names)** | `function_name` is `<anonymous>` or empty | Skip frame, note in comment: "X frames skipped (minified). Enable Sentry source maps." |
-| **Orbit not enabled on group** | `GET /api/v4/orbit/status` returns non-healthy | Comment: "Orbit is not enabled on this group. See setup guide." + fail gracefully |
-| **Orbit returns 0 results for symbol** | Empty `nodes` in response | `orbit_miss=True`, try file-level fallback; if still 0, mark as "Not in Orbit index" |
-| **Orbit API timeout** | httpx `ReadTimeout` after 30s | Retry 3× with exponential backoff; on final failure, mark frame as `orbit_unavailable` |
-| **Orbit API rate limit (429)** | HTTP 429 response | Respect `Retry-After` header; wait and retry |
-| **Orbit API 5xx** | HTTP 500–599 | Retry 3× same as timeout |
-| **MR has no linked issues** | Empty `WorkItem` list from secondary query | Show MR without issue link; don't fabricate intent |
-| **Same MR across multiple frames** | Duplicate `mr.iid` in results | Merge entries, use max confidence, show once |
-| **Stack trace is 50+ frames deep** | `len(raw_frames) > MAX_FRAMES` | Take top `MAX_FRAMES` non-library frames, note how many were omitted |
-| **Function appears in multiple files** | Multiple `Definition` nodes for same name | Return all, prefer the one in the same directory as the error's culprit file |
-| **Unicode in function/file names** | Non-ASCII in `function_name` or `file_path` | Handle natively (Python str handles Unicode); ensure Orbit query is URL-encoded |
-| **Sentry issue fired twice for same error** | Second `work_item_created` on updated issue | Idempotency guard (label check) prevents double-analysis |
-| **GitLab API rate limit** | HTTP 429 on issue note creation | Retry with `Retry-After`; log warning |
-| **Missing `api` scope on token** | HTTP 403 on note creation | Fail with clear error: "Token missing `api` scope. Check ROOTCHAIN_GITLAB_TOKEN." |
-| **Project not under Orbit-enabled group** | Orbit returns empty for all queries | Comment: "Project may not be under the Orbit-indexed group. Check ROOTCHAIN_GROUP_PATH." |
-| **Error in Go with goroutine prefix** | `goroutine N [...]` header before frames | Strip goroutine header before parsing frames |
-| **Java exception chaining (`Caused by:`)** | Multiple exception blocks | Parse each `Caused by` block; use the root cause block as primary |
-| **Orbit symbol indexed from different branch** | Definition found but line numbers differ | Note: "Symbol found, but indexing may be from a different branch. Orbit indexes default branch only." |
-| **Very new code not yet indexed by Orbit** | `merged_at` of MR is < 24h ago | `orbit_miss=True` with reason: "Code may not be indexed yet. Orbit indexes on a cycle." |
-
----
-
-## Coding Practices
-
-### General
-
-- **Python 3.11+**: Use `match` statements, `ExceptionGroup`, `Self` type, `tomllib`, variadic generics where appropriate.
-- **Type hints everywhere**: All functions, all parameters, all return values. No bare `Any` except at JSON parsing boundaries (where Pydantic takes over immediately).
-- **Pydantic v2 models**: Use `model_validator`, `field_validator`, `model_config`. Never use `dict` for structured data — always a model.
-- **No mutable default arguments**: Use `None` defaults and initialize inside function.
-- **Early returns**: Validate and return (or raise) at the top of functions. No deeply nested if-else pyramids.
-- **Single responsibility**: Each file does one thing. `sentry_parser.py` only parses. `orbit_client.py` only queries Orbit.
-
-### Error Handling
-
-- Use a `Result` pattern for operations that can fail gracefully:
-
-```python
-from dataclasses import dataclass
-from typing import TypeVar, Generic
-
-T = TypeVar("T")
-
-@dataclass
-class Ok(Generic[T]):
-    value: T
-
-@dataclass
-class Err:
-    message: str
-    code: str                  # e.g. "orbit_timeout", "no_stack_trace"
-    retryable: bool = False
-
-type Result[T] = Ok[T] | Err
-```
-
-- Never swallow exceptions silently. Always log at minimum with `structlog`.
-- Distinguish retryable errors (network, 5xx) from permanent errors (4xx, bad input).
-- Every external API call is wrapped in `try/except` with specific exception types.
-
-### Async
-
-- All I/O is async. Use `httpx.AsyncClient` everywhere.
-- Never use `asyncio.run()` inside library code — only in entry points.
-- Use `asyncio.gather()` for parallel Orbit queries (one per frame).
-- Set `limits=httpx.Limits(max_connections=10, max_keepalive_connections=5)` on the shared client.
-
-### Logging
-
-```python
-import structlog
-
-log = structlog.get_logger()
-
-# Always log with context, never with string formatting:
-log.info("orbit_query_complete",
-    function_name=frame.function_name,
-    file_path=frame.file_path,
-    mr_count=len(result.recent_mrs),
-    query_time_ms=elapsed_ms,
-)
-
-# Never:
-log.info(f"Orbit query for {frame.function_name} returned {len(result)} MRs")
-```
-
-### Configuration
-
-All config is loaded exactly once at startup via `Config.from_env()`. Never call `os.getenv()` outside of `config.py`. The `Config` object is passed explicitly to components — no global state.
-
-```python
-@dataclass(frozen=True)
-class Config:
-    gitlab_token: str
-    gitlab_url: str
-    group_path: str
-    project_path: str
-    orbit_timeout: int = 30
-    orbit_max_retries: int = 3
-    max_frames: int = 5
-    # ... etc
-    
-    @classmethod
-    def from_env(cls) -> "Config":
-        return cls(
-            gitlab_token=_require_env("ROOTCHAIN_GITLAB_TOKEN"),
-            gitlab_url=os.getenv("ROOTCHAIN_GITLAB_URL", "https://gitlab.com"),
-            group_path=_require_env("ROOTCHAIN_GROUP_PATH"),
-            project_path=_require_env("ROOTCHAIN_PROJECT_PATH"),
-            # ... parse and validate each field
-        )
-```
-
-### Testing
-
-- Aim for **80%+ unit test coverage** across `src/rootchain/`.
-- Use `pytest-asyncio` for all async tests.
-- Mock all external calls (Orbit, GitLab) in unit tests using `httpx.MockTransport` or `respx`.
-- Keep fixtures in `tests/fixtures/*.json` — never hardcode sample data in test files.
-- Integration tests (in `tests/integration/`) are skipped unless `ROOTCHAIN_INTEGRATION_TESTS=1` is set.
-- Every edge case in the "Edge Cases" section above must have at least one unit test.
-
-### Reusability
-
-- `OrbitClient` is framework-agnostic — it only depends on `httpx` and `Config`. It can be imported into other projects.
-- `SentryParser` has no external dependencies beyond `re` and Pydantic. It is independently useful.
-- `BlameChainBuilder` takes `SentryEvent` and `list[SymbolHistory]` — pure functions with no I/O.
-- `IssueFormatter` takes `BlameChain` and returns `str` — pure, no I/O.
-
-All I/O happens only in `OrbitClient`, `GitLabClient`, and `orchestrator.py`.
+**Q: What's the performance impact on GitLab?**  
+Each flow run makes 5–25 Orbit queries (depending on frames and fallback strategies), all async. Well within GitLab's API rate limits.
 
 ---
 
 ## Testing
 
-### Unit tests
-
 ```bash
-# Run all unit tests
+# Unit tests (no external calls)
 pytest tests/unit/ -v
 
-# Run with coverage
+# With coverage
 pytest tests/unit/ --cov=src/rootchain --cov-report=term-missing
 
-# Run a specific test
-pytest tests/unit/test_sentry_parser.py::test_parse_python_stacktrace -v
-```
-
-### Integration tests
-
-Requires a real GitLab project with Orbit enabled:
-```bash
+# Integration tests (requires live GitLab + Orbit)
 export ROOTCHAIN_INTEGRATION_TESTS=1
 export ROOTCHAIN_GITLAB_TOKEN=glpat-xxx
-export ROOTCHAIN_GROUP_PATH=your-group
-export ROOTCHAIN_PROJECT_PATH=your-group/your-project
+export ROOTCHAIN_GROUP_PATH=my-org
+export ROOTCHAIN_PROJECT_PATH=my-org/my-app
 pytest tests/integration/ -v
-```
-
-### Manual end-to-end test
-
-```bash
-# Create a test issue that looks like a Sentry alert
-python scripts/generate_test_issue.py \
-  --project-path "your-group/your-project" \
-  --token "$ROOTCHAIN_GITLAB_TOKEN" \
-  --language python
-
-# Watch the flow activate (takes up to 2 minutes)
-# Then check the issue for the RootChain comment
-```
-
-### Test fixtures
-
-All fixtures in `tests/fixtures/` represent real-world samples:
-- `sentry_python.json`: Python Flask app TypeError
-- `sentry_node.json`: Node.js Express app ReferenceError
-- `sentry_go.json`: Go service panic with goroutine prefix
-- `sentry_minified_js.json`: React app with no readable frame names (source maps missing)
-- `orbit_response_full.json`: Full response with MR, linked issue, and reviewer
-- `orbit_response_empty.json`: Orbit returns no results (orbit_miss case)
-- `gitlab_issue_sentry.json`: Raw GitLab issue payload as created by Sentry integration
-
----
-
-## Deployment
-
-### GitLab CI/CD pipeline (`.gitlab-ci.yml`)
-
-```yaml
-stages:
-  - lint
-  - test
-  - validate
-  - smoke
-
-lint:
-  stage: lint
-  image: python:3.11-slim
-  script:
-    - pip install ruff mypy
-    - ruff check src/ tests/
-    - mypy src/rootchain/
-
-test:unit:
-  stage: test
-  image: python:3.11-slim
-  script:
-    - pip install -e ".[dev]"
-    - pytest tests/unit/ --cov=src/rootchain --cov-fail-under=80
-
-validate:flow:
-  stage: validate
-  image: python:3.11-slim
-  script:
-    - pip install -e ".[dev]"
-    - python scripts/validate_flow.py .gitlab/duo-flows/rootchain.yml
-
-smoke:orbit:
-  stage: smoke
-  image: python:3.11-slim
-  rules:
-    - if: $CI_COMMIT_BRANCH == "main"
-  script:
-    - pip install -e ".[dev]"
-    - python scripts/test_orbit_connection.py
-  variables:
-    ROOTCHAIN_GITLAB_TOKEN: $ROOTCHAIN_GITLAB_TOKEN
-    ROOTCHAIN_GROUP_PATH: $ROOTCHAIN_GROUP_PATH
-```
-
-### Webhook receiver (Option B) — Fly.io
-
-```bash
-cd receiver/
-fly launch --name rootchain-receiver --region sin  # Singapore
-fly secrets set ROOTCHAIN_GITLAB_TOKEN="glpat-xxx"
-fly secrets set ROOTCHAIN_WEBHOOK_SECRET="your-secret"
-fly secrets set ROOTCHAIN_GITLAB_URL="https://gitlab.com"
-fly secrets set ROOTCHAIN_PROJECT_PATH="your-group/your-project"
-fly deploy
-```
-
-The free Fly.io plan is sufficient — this receiver is stateless and low-traffic.
-
----
-
-## Publishing to the GitLab AI Catalog
-
-The hackathon requires at least one agent or flow to be published to the AI Catalog.
-
-1. Ensure the project is **public** with MIT license
-2. In your GitLab project: **AI → Flows → Managed tab → click rootchain → Publish to AI Catalog**
-3. Fill in:
-   - **Display name:** RootChain
-   - **Tagline:** Trace any production error to its SDLC origin via GitLab Orbit — works with Sentry, GitLab error tracking, CI failures, and more
-   - **Category:** DevSecOps / Incident Response
-   - **Tags:** `orbit`, `incident-response`, `blame-chain`, `sdlc`, `sentry`, `debugging`
-4. Submit for review
-
-Alternatively, via API:
-```bash
-curl --request POST \
-  --header "PRIVATE-TOKEN: $ROOTCHAIN_GITLAB_TOKEN" \
-  --header "Content-Type: application/json" \
-  --data '{
-    "flow_name": "rootchain",
-    "display_name": "RootChain",
-    "description": "Trace production Sentry errors to SDLC blame chains via GitLab Orbit",
-    "tags": ["orbit", "sentry", "incident-response"]
-  }' \
-  "https://gitlab.com/api/v4/ai_catalog/flows"
 ```
 
 ---
 
 ## Troubleshooting
 
-### "Orbit status is not healthy"
-- Check that Orbit is enabled on the group (not just the project)
-- Orbit requires GitLab.com Premium or self-managed Ultimate
-- Initial indexing can take up to 30 minutes for large groups
+**Flow did not activate**  
+Check that a trigger is configured at **AI → Triggers**. The flow YAML defines the agent; the trigger is configured separately and must exist for the flow to fire automatically.
 
-### "Flow did not activate after issue creation"
-- Verify a trigger is configured at **AI → Triggers** for `work_item_created` targeting rootchain
-- If you use a label filter, ensure the issue has a matching label
-- Check **AI → Flows → Managed → rootchain → Sessions** for the run log
-- Ensure GitLab Duo is enabled for the project
+**Agent posted no comment (tools reported as unavailable)**  
+Verify `.gitlab/duo-flows/rootchain.yml` has `create_issue_note` and `update_issue` in the toolset — not `create_note` / `add_label`, which are not valid tool names.
 
-### "Orbit queries return 0 results"
-- Check that the file path in the stack trace matches what Orbit has indexed
-- Orbit indexes the **default branch only** — ensure code is on `main`/`master`
-- New code merged less than ~1 hour ago may not be indexed yet
+**All frames show "Not in Orbit index"**  
+- Orbit must be enabled on the group, not just the project
+- Code must be on the default branch (`main`/`master`)
+- Recently merged code (~< 1h) may not be indexed yet — Strategy 4 (commits REST API) handles this automatically
 
-### "TypeError on frame parsing"
-- Run the Sentry issue description through `SentryParser.debug_parse(description)` locally
-- Check `tests/fixtures/` for the closest matching sample and compare formats
-- Add a new fixture if you've found a new Sentry format variant
+**HTTP 403 on issue update**  
+The token needs `api` scope (not `read_api`). For group tokens, ensure group-level API access is enabled under Group → Settings → General → Permissions.
 
-### "GitLab API 403 on issue update"
-- The token needs `api` scope (not just `read_api`)
-- Ensure the token has access to the target project
-- For group-level tokens: ensure group-level API access is enabled
+**Confidence scores all 0.0**  
+All frames returned `orbit_miss`. Enable `ROOTCHAIN_LOG_LEVEL=DEBUG` and inspect the structured logs for `orbit_no_mr_data` vs `orbit_commits_api_hit` to see which strategy ran.
 
-### "Confidence scores are all 0.0"
-- This typically means `orbit_miss=True` for all frames
-- Check if the project's code is under the `ROOTCHAIN_GROUP_PATH` group
-- Enable `ROOTCHAIN_LOG_LEVEL=DEBUG` and inspect Orbit query responses
+Full troubleshooting guide: [`docs/troubleshooting.md`](docs/troubleshooting.md)
 
 ---
 
-## FAQ
-
-**Q: Does RootChain require Sentry?**  
-A: No. Any GitLab issue with a stack trace anywhere in the description will trigger the analysis. Sentry is one source — GitLab error tracking, CI failures, crash reports, and manual bug reports all work equally well. The trigger label filter is optional and configurable.
-
-**Q: Does RootChain work with GitLab self-managed?**  
-A: Yes, if your instance has Orbit Remote enabled (requires Ultimate tier with ClickHouse). Set `ROOTCHAIN_GITLAB_URL` to your instance URL.
-
-**Q: What languages are supported?**  
-A: Python, Node.js/JavaScript/TypeScript, Go, Ruby, Java, Kotlin, and Rust. Kotlin uses the same JVM frame format as Java but is detected via `.kt` file extension and tagged separately. Rust handles both the old panic format and the Rust 1.73+ two-line frame format. Unknown languages attempt generic frame detection.
-
-**Q: What happens if the MR has no linked issues?**  
-A: RootChain shows the MR title and author without issue context. It will not fabricate intent.
-
-**Q: Can I disable @mentions?**  
-A: Set `ROOTCHAIN_MENTION_AUTHORS=false`. Useful in high-alert-volume projects.
-
-**Q: How do I tune for a monorepo?**  
-A: Set `ROOTCHAIN_GROUP_PATH` to the top-level group. Orbit Remote indexes the entire group, so monorepo projects are handled automatically.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
----
-
-## What's Next
-
-RootChain demonstrates a pattern — **inverse debugging via SDLC graph traversal** — that extends well beyond Sentry alerts. Planned extensions:
-
-### Immediate (next sprint)
-- **PagerDuty / OpsGenie webhook receiver** — same flow, different alert source
-- **Slack integration** — post the blame chain to `#incidents` alongside the GitLab issue link
-- **Auto-assign** — set the issue assignee to the primary suspect's MR author (configurable)
-- **GitLab runbooks** — if the blamed MR has a linked runbook, surface it in the comment
-- **Java `Caused by:` chain multi-root** — trace all exception layers, not just the outermost
-
-### Medium-term
-- **Security triage** — the same Orbit traversal from CVE advisory → file → MR → author tells you exactly who introduced a vulnerability and what business change motivated it
-- **CI failure attribution** — when a pipeline fails on `main`, trace failing test files through the same graph to find the MR that broke the build
-- **Coverage delta** — query Orbit's CI domain to show whether the blamed MR's code had test coverage and whether coverage dropped
-- **Confidence history** — store RootChain comment scores in a GitLab custom property; over time, identify which functions are "serial suspects" that need refactoring
-
-### Architecture extensions
-- **Multi-language Orbit domains** — Orbit's `security` domain (Vulnerabilities), `ci` domain (Pipelines/Jobs), and `plan` domain (iterations/epics) open new traversal paths not yet used by RootChain
-- **AI Catalog distribution** — publish RootChain as a reusable flow that any GitLab group can install with one click and immediately use with their own Sentry + Orbit setup
-
----
-
-## Why This Is Non-Obvious
-
-Most Orbit use cases are forward queries: "what changed recently?" or "who owns this file?" RootChain inverts the direction: it starts from a **runtime signal** (a production error) and walks backward through the SDLC graph to find the **causal human decision**.
-
-The key insight is the multi-hop path:
+## Project Structure
 
 ```
-TypeError at runtime
-  → stack frame: processPayment() in payments/processor.py
-  → Orbit: Definition[processPayment] -[:DEFINED_IN]→ File[processor.py]
-  → Orbit: File[processor.py] ←[:MODIFIES_FILE]- MergeRequest[!342]
-  → Orbit: MergeRequest[!342] -[:CLOSES]→ WorkItem[#89: "Add retry logic"]
-  → Orbit: MergeRequest[!342] ←[:REVIEWED_BY]- User[@dave]
-  → Orbit: Definition[processPayment] ←[:CALLS]- 7 other functions (blast radius)
+.gitlab/
+  duo-flows/rootchain.yml     ← The only required file for integration
+  skills/rootchain/SKILL.md   ← Agent parsing + scoring rules (loaded as context)
+
+src/rootchain/
+  models.py          ← All Pydantic v2 models
+  config.py          ← Env-var-driven Config dataclass
+  sentry_parser.py   ← Stack trace parser (7 languages)
+  orbit_client.py    ← Orbit REST client (5-strategy MR discovery, async)
+  blame_chain.py     ← Confidence scoring + blame chain construction
+  issue_formatter.py ← BlameChain → Markdown
+  gitlab_client.py   ← GitLab API client (notes, labels)
+  orchestrator.py    ← Entry point for standalone use
+
+receiver/            ← Optional FastAPI webhook receiver
+tests/unit/          ← 141 tests, no external calls
 ```
 
-No individual hop in this chain is novel. What's novel is executing all hops in a single automated flow triggered by a runtime error, and **ranking** the results by a confidence formula that weighs recency, frame depth, and blast radius simultaneously.
+---
 
-The blast radius dimension (counting callers via the `CALLS` graph edge) is particularly underutilized in current tooling. A function called by 15 other functions that was changed 3 days ago is a much higher-priority suspect than a function called by 1 other function that was changed yesterday. RootChain's formula makes this explicit and tunable.
+## Tech Stack
+
+| Component | Technology |
+|-----------|-----------|
+| Agent Platform | GitLab Duo Agent Platform |
+| Knowledge Graph | GitLab Orbit (Remote) |
+| HTTP | `httpx` (async) |
+| Data models | Pydantic v2 |
+| Retries | `tenacity` |
+| Logging | `structlog` (structured JSON) |
+| Testing | `pytest` + `pytest-asyncio` + `respx` |
 
 ---
 
@@ -1365,6 +403,10 @@ The blast radius dimension (counting callers via the `CALLS` graph edge) is part
 
 Built for the [GitLab Transcend Hackathon](https://gitlab-transcend.devpost.com/) — Showcase Track.
 
-**Source code:** [github.com/Purv-Kabaria/RootChain](https://github.com/Purv-Kabaria/RootChain)
+The core bet: GitLab's SDLC graph already contains the answer to "why did this break?" On-call engineers spend 30–90 minutes reconstructing context that Orbit has indexed. RootChain is a single-file integration that makes that context appear automatically when it's needed most.
 
-**The story:** Every on-call engineer has spent the dead hours of night reconstructing context that already existed inside GitLab. RootChain collapses that reconstruction into a 2-minute automatic analysis. The insight is not that AI can help you debug — it's that GitLab's own SDLC graph, queried via Orbit, already contains the answer. RootChain is just the bridge between the runtime signal and the historical context.
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE).

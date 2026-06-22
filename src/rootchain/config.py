@@ -67,6 +67,9 @@ class Config:
     blast_weight: float = 0.15
     recency_half_life_days: int = 30
 
+    # Repository
+    default_branch: str = "main"
+
     # Output
     add_label: str = "rootchain-analyzed"
     mention_authors: bool = True
@@ -99,6 +102,7 @@ class Config:
             depth_weight=_float_env("ROOTCHAIN_DEPTH_WEIGHT", 0.35),
             blast_weight=_float_env("ROOTCHAIN_BLAST_WEIGHT", 0.15),
             recency_half_life_days=_int_env("ROOTCHAIN_RECENCY_HALF_LIFE_DAYS", 30),
+            default_branch=os.getenv("ROOTCHAIN_DEFAULT_BRANCH", "main"),
             add_label=os.getenv("ROOTCHAIN_ADD_LABEL", "rootchain-analyzed"),
             mention_authors=_bool_env("ROOTCHAIN_MENTION_AUTHORS", True),
             mention_reviewers=_bool_env("ROOTCHAIN_MENTION_REVIEWERS", False),

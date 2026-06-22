@@ -1,7 +1,4 @@
-"""Render a BlameChain into a Markdown comment string.
-
-Pure function: takes BlameChain + SentryEvent, returns str. No I/O.
-"""
+"""Render a BlameChain into a Markdown comment string."""
 
 from __future__ import annotations
 

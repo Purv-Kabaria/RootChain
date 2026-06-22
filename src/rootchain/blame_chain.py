@@ -1,7 +1,4 @@
-"""Build and score the blame chain from Orbit symbol histories.
-
-Pure functions: takes models, returns models. No I/O.
-"""
+"""Build and score the blame chain from Orbit symbol histories."""
 
 from __future__ import annotations
 
@@ -22,9 +19,6 @@ from .models import (
 log = structlog.get_logger()
 
 
-# ---------------------------------------------------------------------------
-# Confidence scoring
-# ---------------------------------------------------------------------------
 
 
 def calculate_confidence(
@@ -78,9 +72,6 @@ def _confidence_label(score: float) -> str:
     return "LOW"
 
 
-# ---------------------------------------------------------------------------
-# Deduplication
-# ---------------------------------------------------------------------------
 
 
 def _deduplicate_entries(entries: list[BlameEntry]) -> list[BlameEntry]:
@@ -100,9 +91,6 @@ def _deduplicate_entries(entries: list[BlameEntry]) -> list[BlameEntry]:
     return sorted(deduped, key=lambda e: e.confidence, reverse=True)
 
 
-# ---------------------------------------------------------------------------
-# Public builder
-# ---------------------------------------------------------------------------
 
 
 def build_blame_chain(
@@ -114,9 +102,10 @@ def build_blame_chain(
 
     histories must be in the same order as event.frames.
     """
-    assert len(event.frames) == len(histories), (
-        "frames and histories must have the same length"
-    )
+    if len(event.frames) != len(histories):
+        raise ValueError(
+            f"frames ({len(event.frames)}) and histories ({len(histories)}) must have the same length"
+        )
 
     entries: list[BlameEntry] = []
 

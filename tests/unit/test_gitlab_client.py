@@ -124,6 +124,70 @@ async def test_add_label_403_not_retryable(config):
 
 
 # ---------------------------------------------------------------------------
+# get_issue
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_issue_success(config):
+    payload = {
+        "iid": 7, "title": "Some bug", "description": "stack trace here",
+        "labels": ["bug"], "state": "opened",
+    }
+    with respx.mock(base_url="https://gitlab.example.com/api/v4") as mock:
+        mock.get("/projects/myorg%2Fmyapp/issues/7").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        async with GitLabClient(config) as client:
+            result = await client.get_issue("myorg/myapp", 7)
+
+    assert isinstance(result, Ok)
+    assert result.value["title"] == "Some bug"
+    assert result.value["labels"] == ["bug"]
+
+
+@pytest.mark.asyncio
+async def test_get_issue_404(config):
+    with respx.mock(base_url="https://gitlab.example.com/api/v4") as mock:
+        mock.get("/projects/myorg%2Fmyapp/issues/99").mock(
+            return_value=httpx.Response(404)
+        )
+        async with GitLabClient(config) as client:
+            result = await client.get_issue("myorg/myapp", 99)
+
+    assert isinstance(result, Err)
+    assert result.code == "gitlab_not_found"
+    assert not result.retryable
+
+
+@pytest.mark.asyncio
+async def test_get_issue_403(config):
+    with respx.mock(base_url="https://gitlab.example.com/api/v4") as mock:
+        mock.get("/projects/myorg%2Fmyapp/issues/7").mock(
+            return_value=httpx.Response(403)
+        )
+        async with GitLabClient(config) as client:
+            result = await client.get_issue("myorg/myapp", 7)
+
+    assert isinstance(result, Err)
+    assert result.code == "gitlab_forbidden"
+    assert not result.retryable
+
+
+@pytest.mark.asyncio
+async def test_get_issue_network_error(config):
+    with respx.mock(base_url="https://gitlab.example.com/api/v4") as mock:
+        mock.get("/projects/myorg%2Fmyapp/issues/7").mock(
+            side_effect=httpx.NetworkError("connection refused")
+        )
+        async with GitLabClient(config) as client:
+            result = await client.get_issue("myorg/myapp", 7)
+
+    assert isinstance(result, Err)
+    assert result.retryable
+
+
+# ---------------------------------------------------------------------------
 # get_issue_labels
 # ---------------------------------------------------------------------------
 
