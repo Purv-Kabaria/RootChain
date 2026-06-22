@@ -1,7 +1,7 @@
 # RootChain
 
 > **GitLab Duo Agent Platform · Showcase Track**
-> Trace production errors to their SDLC origin — automatically, in under 2 minutes.
+> One YAML file. Drop it in any GitLab project. Automatically traces production errors to their SDLC origin in under 2 minutes.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![GitLab Duo](https://img.shields.io/badge/GitLab-Duo%20Agent%20Platform-orange)](https://docs.gitlab.com/user/duo_agent_platform/)
@@ -14,11 +14,11 @@
 
 ## The Problem
 
-A production 500 error fires at 2am. Your on-call engineer opens the Sentry alert, sees a stack trace, and starts doing archaeology: `git blame` on each frame, grepping closed issues, finding the MR that introduced the change, messaging the author on Slack. This takes 30–90 minutes before a single line of fix is written. The answer has been sitting inside GitLab the whole time — in the MR that changed the function, the issue that motivated it, the reviewer who approved it — just disconnected from the runtime error.
+A production 500 error fires at 2am. Your on-call engineer opens the alert, sees a stack trace, and starts doing archaeology: `git blame` on each frame, grepping closed issues, finding the MR that introduced the change, messaging the author on Slack. This takes 30–90 minutes before a single line of fix is written. The answer has been sitting inside GitLab the whole time — in the MR that changed the function, the issue that motivated it, the reviewer who approved it — just disconnected from the runtime error.
 
 **RootChain closes that gap.**
 
-When Sentry creates a GitLab issue for a production alert, RootChain's GitLab Duo Agent Platform flow automatically activates. It parses the stack trace, queries GitLab Orbit for the SDLC history of each relevant frame, and posts a structured blame-chain analysis back to the issue — identifying the most likely causal MR, the intent behind it, and who to loop in — within 2 minutes of the alert firing.
+When a production error lands as a GitLab issue — whether from Sentry, GitLab error tracking, a CI failure, a crash report, or a manually filed bug — RootChain's Duo Agent Platform flow automatically activates. It parses the stack trace, queries GitLab Orbit for the SDLC history of each relevant frame, and posts a structured blame-chain analysis back to the issue — identifying the most likely causal MR, the intent behind it, and who to loop in — within 2 minutes.
 
 **What changes:** On-call engineers open the GitLab issue to find context already waiting for them. "This error was most likely introduced by MR !342 (4 days ago), which was implementing issue #89 (payment retry logic), approved by @alice. The function `processPayment()` was changed to add a retry branch that may not handle null gateway responses."
 
@@ -27,19 +27,19 @@ When Sentry creates a GitLab issue for a production alert, RootChain's GitLab Du
 ## Demo Flow
 
 ```
-Sentry fires alert: "TypeError: Cannot read property 'id' of undefined"
+Production error fires (Sentry / GitLab error tracking / CI failure / crash report)
           │
           ▼
-Sentry–GitLab integration creates GitLab issue (label: sentry-alert)
+Error lands as a GitLab issue with a stack trace in the description
           │
           ▼
 work_item_created trigger activates RootChain flow
           │
           ▼
-Flow parses stack trace from issue description
+Flow parses stack trace (Python / Node.js / Go / Ruby / Java / Rust)
           │
           ▼
-Orbit REST API queries: Definition → MergeRequest → WorkItem + User
+Orbit REST API queries: File → MergeRequest → WorkItem + User
           │
           ▼
 Agent builds ranked blame-chain (confidence-scored per frame)
@@ -59,7 +59,7 @@ On-call engineer sees: primary suspect MR, intent, author, suggested fix path
 
 ```mermaid
 flowchart TD
-    A[Sentry fires alert] -->|native GitLab integration| B[GitLab Issue created\nlabels: sentry-alert, Sentry]
+    A[Production error fires\nSentry / GitLab / CI / crash] -->|issue created in GitLab| B[GitLab Issue created\nwith stack trace in description]
     B -->|work_item_created event| C[RootChain Flow activates]
     C --> D{Already has\nrootchain-analyzed\nlabel?}
     D -->|Yes| E[Stop — idempotency guard]
@@ -136,15 +136,11 @@ flowchart TD
 
 #### 1. Trigger & Entry
 
-**Trigger:** `work_item_created`
-**Filter:** Issue label contains `sentry-alert` OR issue title matches `^\[Sentry\]`
-**Context injected into agent:**
-- `WorkItem.Title` — the Sentry error title
-- `WorkItem.Description` — full issue body (contains stack trace in Sentry's format)
-- `WorkItem.Labels` — label set for validation
-- `WorkItem.IID` — issue number for the update call
-- `WorkItem.Project.FullPath` — namespace/project for Orbit scoping
-- `WorkItem.WebURL` — for linking back
+**Trigger:** `work_item_created` (and optionally `work_item_updated`)
+**Filter:** Optional — configure in AI → Triggers. Leave the label filter empty to run on all issues, or restrict to labels like `bug`, `incident`, `sentry-alert`, `crash`, etc.
+**Context injected into agent:** `project_id` (numeric project ID) and `goal` (issue IID)
+
+The agent's very first action is `get_issue` with the project_id and IID to read the full issue.
 
 **Guard check (first thing the agent does):**
 ```
@@ -152,26 +148,15 @@ IF already has label "rootchain-analyzed" → exit immediately (idempotency)
 IF issue body has no recognizable stack trace → add comment "RootChain: No stack trace detected" → exit
 ```
 
-#### 2. Sentry Event Parsing
+#### 2. Stack Trace Parsing
 
-The agent parses the GitLab issue description to extract a `SentryEvent` structure. Sentry's GitLab integration creates issues with a predictable format:
+The agent parses the GitLab issue description to extract stack frames. The issue may come from:
+- **Sentry** (native GitLab integration): `## ErrorType: msg` heading + `### Stacktrace` section
+- **GitLab error tracking**: similar Sentry-like format
+- **CI pipeline failure**: pasted crash output in issue description
+- **Crash report / manual bug**: any standard traceback pasted into the description
 
-```
-## TypeError: Cannot read property 'id' of undefined
-
-**Culprit:** payments/processor.py in processPayment at line 142
-**Environment:** production
-**Times seen:** 47
-
-### Stacktrace
-
-  File "payments/processor.py", line 142, in processPayment
-    result = gateway_response['id']
-  File "payments/gateway.py", line 88, in call_gateway
-    return self._session.post(url, data=payload)
-  File "core/session.py", line 34, in post
-    return requests.post(...)
-```
+Common formats handled:
 
 **Parsing rules per language:**
 
@@ -644,38 +629,37 @@ In your forked project, go to **Settings → CI/CD → Variables** and add:
 The flow is defined in `.gitlab/duo-flows/rootchain.yml`. It is automatically picked up by the Duo Agent Platform when present in the project. No additional registration step is required.
 
 Verify the flow is recognized:
-1. Go to **your-project → Duo Agent Platform → Flows**
-2. You should see `rootchain` in the list
-3. Status should be `active`
+1. Go to **your-project → AI → Flows → Managed tab**
+2. You should see `rootchain` listed there
+   (The "Enabled" tab shows only GitLab-provided flows — your custom flow is under "Managed")
+3. Click into it to confirm the YAML loaded correctly
 
-### Step 6: Connect Sentry
+### Step 6: Connect your error source (optional — any will work)
 
-**Option A — Native Sentry–GitLab integration (recommended):**
+RootChain activates on any `work_item_created` event, so any system that creates GitLab issues automatically qualifies. No specific integration is required.
 
-1. In Sentry: **Settings → Integrations → GitLab**
-2. Connect your GitLab account (OAuth)
-3. Choose the GitLab project where issues should be created
-4. In Sentry alert rules: add action **"Create a GitLab issue"** for the desired alert rule
-5. Set the label to `sentry-alert` in the issue creation settings
+**Option A — Sentry native integration:**
+1. In Sentry: **Settings → Integrations → GitLab** → connect and configure issue creation
+2. Set labels on the Sentry alert rule (e.g., `sentry-alert`) if using a label-filtered trigger
+3. Sentry creates issues with title `[Sentry] ErrorType: message` — RootChain parses these automatically
 
-Sentry creates issues with the title format: `[Sentry] ErrorType: message`  
-The label `Sentry` is added automatically; we also need `sentry-alert`. Configure Sentry to add this label, or add a GitLab label event trigger that auto-adds `sentry-alert` whenever a `Sentry` label is added.
+**Option B — GitLab error tracking:**
+GitLab's built-in error tracking creates issues in the same format. No extra setup needed.
 
-**Option B — Webhook receiver (if native integration unavailable):**
-
-Deploy the receiver:
+**Option C — Manual or scripted issue creation:**
+Any issue with a stack trace pasted in the description works. Create a test issue manually:
 ```bash
-cd receiver/
-# Edit fly.toml: set app name, add env vars
-flyctl deploy
+python scripts/generate_test_issue.py \
+  --project-path "your-group/your-project" \
+  --token "$ROOTCHAIN_GITLAB_TOKEN"
 ```
 
-In Sentry: **Settings → Developer Settings → Internal Integrations → New**
-- Add webhook URL: `https://your-receiver.fly.dev/webhook/sentry`
-- Event: `issue` (created + triggered)
-- Add header: `X-Rootchain-Secret: {your_secret}`
-
-Add to CI variables: `ROOTCHAIN_WEBHOOK_SECRET`
+**Option D — Webhook receiver (custom integration):**
+Deploy `receiver/main.py` to receive webhooks from any alert system and translate them to GitLab issues:
+```bash
+cd receiver/
+flyctl deploy
+```
 
 ### Step 7: Verify end-to-end
 
@@ -740,71 +724,41 @@ ROOTCHAIN_LOG_FORMAT=json          # json | console (use console for local dev)
 
 ### Flow Definition (`.gitlab/duo-flows/rootchain.yml`)
 
+The flow uses the GitLab Duo Agent Platform v1 schema. Key structure:
+
 ```yaml
-name: rootchain
-description: >
-  RootChain traces production Sentry errors to their SDLC origin.
-  When Sentry creates a GitLab issue for a production alert, this flow
-  queries GitLab Orbit to find which MRs last modified each stack frame,
-  what work items motivated those changes, and who the relevant authors
-  and reviewers are.
-version: 1
+version: "v1"
+environment: ambient
 
-trigger:
-  events:
-    - work_item_created
+components:
+  - name: "parse_and_trace"
+    type: AgentComponent
+    prompt_id: "rootchain_prompt"
+    inputs:
+      - "context:goal"        # work item IID, available as {{goal}} in prompts
+      - "context:project_id"  # numeric project ID, available as {{project_id}}
+    toolset:
+      - get_issue
+      - query_graph
+      - create_note
+      - add_label
 
-filter:
-  labels:
-    any_of:
-      - sentry-alert
-      - Sentry
-  title_matches: '^\[Sentry\]|\[Error\]|TypeError|ValueError|NullPointerException|RuntimeError|ReferenceError|panic'
+prompts:
+  - prompt_id: "rootchain_prompt"
+    # ... system prompt with all 8 steps + two critical rules ...
+    unit_primitives: []
+    params:
+      timeout: 180
 
-context:
-  goal: |
-    A Sentry production error has been automatically filed as a GitLab issue.
+routers:
+  - from: "parse_and_trace"
+    to: "end"
 
-    Issue details:
-    - IID: {{ .WorkItem.IID }}
-    - Title: {{ .WorkItem.Title }}
-    - Project: {{ .WorkItem.Project.FullPath }}
-    - Web URL: {{ .WorkItem.WebURL }}
-    - Labels: {{ .WorkItem.Labels | join ", " }}
-
-    Full issue description (contains the Sentry stack trace):
-    ---
-    {{ .WorkItem.Description }}
-    ---
-
-    Your task:
-    1. Check if this issue already has the label "rootchain-analyzed". If yes, stop immediately.
-    2. Parse the Sentry error information from the issue description above.
-    3. Extract up to 5 non-library stack frames.
-    4. For each frame, use the Orbit JSON DSL (via query_graph) to find recent MRs
-       that modified the file, the work items those MRs were linked to, and the CI status.
-    5. Build a confidence-ranked blame chain.
-    6. Post a structured analysis comment on the issue.
-    7. Add the label "rootchain-analyzed" to the issue.
-
-    See SKILL.md for the exact JSON DSL query shapes and response format.
-
-steps:
-  - name: parse_and_trace
-    type: agent
-    description: >
-      Parse the Sentry stack trace, query Orbit for each frame's SDLC history,
-      build a confidence-ranked blame chain, and post the analysis comment.
-    skills:
-      - rootchain
-    tools:
-      - query_graph          # Orbit MCP tool — native to Duo Agent Platform
-      - create_note          # Add comment to a GitLab issue
-      - add_label            # Add label to a GitLab issue
-      - get_issue            # Read the current issue state
-    max_iterations: 30       # 5 frames × ~4 queries each + formatting overhead
-    timeout_seconds: 180     # 3 minute hard limit
+flow:
+  entry_point: "parse_and_trace"
 ```
+
+See `.gitlab/duo-flows/rootchain.yml` for the complete flow definition.
 
 ### Key Flow Design Decisions
 
@@ -1275,12 +1229,12 @@ The free Fly.io plan is sufficient — this receiver is stateless and low-traffi
 The hackathon requires at least one agent or flow to be published to the AI Catalog.
 
 1. Ensure the project is **public** with MIT license
-2. In your GitLab project: **Duo Agent Platform → Flows → rootchain → Publish to AI Catalog**
+2. In your GitLab project: **AI → Flows → Managed tab → click rootchain → Publish to AI Catalog**
 3. Fill in:
    - **Display name:** RootChain
-   - **Tagline:** Trace Sentry production errors to their SDLC origin via GitLab Orbit
+   - **Tagline:** Trace any production error to its SDLC origin via GitLab Orbit — works with Sentry, GitLab error tracking, CI failures, and more
    - **Category:** DevSecOps / Incident Response
-   - **Tags:** `orbit`, `sentry`, `incident-response`, `blame-chain`, `sdlc`
+   - **Tags:** `orbit`, `incident-response`, `blame-chain`, `sdlc`, `sentry`, `debugging`
 4. Submit for review
 
 Alternatively, via API:
@@ -1307,8 +1261,9 @@ curl --request POST \
 - Initial indexing can take up to 30 minutes for large groups
 
 ### "Flow did not activate after issue creation"
-- Verify the issue has at least one of the trigger labels (`sentry-alert` or `Sentry`)
-- Check **Project → Duo Agent Platform → Flows → rootchain → Logs**
+- Verify a trigger is configured at **AI → Triggers** for `work_item_created` targeting rootchain
+- If you use a label filter, ensure the issue has a matching label
+- Check **AI → Flows → Managed → rootchain → Sessions** for the run log
 - Ensure GitLab Duo is enabled for the project
 
 ### "Orbit queries return 0 results"
@@ -1335,8 +1290,8 @@ curl --request POST \
 
 ## FAQ
 
-**Q: Does RootChain work without Sentry?**  
-A: Yes. Any GitLab issue with a stack trace in the description and the `sentry-alert` label will trigger the flow. You can create these manually or use a different error tracking tool's GitLab integration.
+**Q: Does RootChain require Sentry?**  
+A: No. Any GitLab issue with a stack trace anywhere in the description will trigger the analysis. Sentry is one source — GitLab error tracking, CI failures, crash reports, and manual bug reports all work equally well. The trigger label filter is optional and configurable.
 
 **Q: Does RootChain work with GitLab self-managed?**  
 A: Yes, if your instance has Orbit Remote enabled (requires Ultimate tier with ClickHouse). Set `ROOTCHAIN_GITLAB_URL` to your instance URL.
