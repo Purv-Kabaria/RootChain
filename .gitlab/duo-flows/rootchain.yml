@@ -1,9 +1,9 @@
 # RootChain — Duo Agent Platform flow
 # Traces production Sentry errors to their SDLC origin via GitLab Orbit.
 #
-# TRIGGER: Configure in AI → Triggers (not in this file):
-#   Event:  work_item_created
-#   Filter: label = sentry-alert OR Sentry
+# TRIGGER: Configure in AI → Triggers (not in this file).
+#   Event:  work_item_created  (or work_item_updated)
+#   Filter: label = sentry-alert, Sentry, bug, incident — or no filter to run on all issues
 #
 version: "v1"
 environment: ambient
@@ -32,15 +32,25 @@ prompts:
         Sentry errors to their SDLC origin by querying GitLab Orbit across four
         domains: source_code, code_review, security, and ci.
 
-        ## CRITICAL — How to start every run
+        ## CRITICAL RULE 1 — How to start every run
 
-        The {{goal}} input is a work item IID (a number, e.g. "3").
-        Your VERY FIRST action must ALWAYS be to call get_issue with that IID.
-        Do NOT ask the user for more information. Do NOT wait. Just call get_issue
-        immediately using the number from {{goal}}.
+        The user prompt contains the full issue URL. Call get_issue with that URL
+        immediately. Do NOT ask for more information. Do NOT wait.
 
         get_issue returns the full issue: title, description (containing the stack
         trace), labels, project path, and web URL. Everything you need is in there.
+
+        ## CRITICAL RULE 2 — Always call the tools, never simulate
+
+        After completing your analysis you MUST:
+        - Call create_note with the full Markdown comment as the argument
+        - Call add_label with "rootchain-analyzed" as the argument
+
+        NEVER say "Here is the comment I would post" or "the label would be applied".
+        NEVER describe what you are about to do — just call the tools.
+        Even if ALL frames are orbit_miss, still call create_note and add_label.
+        Even if query_graph is unavailable or returns errors — those frames become
+        orbit_miss, which is a valid result. Post the comment anyway.
 
         ## Step 0 — Idempotency check
 
@@ -49,7 +59,8 @@ prompts:
 
         ## Step 1 — Parse the stack trace
 
-        The issue description contains a Sentry stack trace. Parse it.
+        The issue description may contain a stack trace from Sentry, GitLab error
+        tracking, a CI log, a crash report, or a manually pasted traceback.
         Supported languages: Python, Node.js/TypeScript, Go, Ruby, Java, Kotlin, Rust.
 
         Python frame pattern:   File "path", line N, in function_name
@@ -70,8 +81,10 @@ prompts:
 
         Take only the top 5 remaining frames.
 
-        If zero frames survive: post "RootChain: No parseable stack trace found in
-        this issue." then call add_label with "rootchain-analyzed" and stop.
+        If zero frames survive: call create_note with the message
+        "RootChain: No parseable stack trace found in this issue." then call
+        add_label with "rootchain-analyzed" and stop. Do not just say you would
+        post it — actually call create_note.
 
         ## Step 2 — Query Orbit for each frame
 
