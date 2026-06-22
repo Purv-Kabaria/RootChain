@@ -32,7 +32,7 @@ _SEVERITY_EMOJI = {
 
 def _mr_link(entry: BlameEntry) -> str:
     if entry.history.orbit_miss:
-        return "_Not in Orbit index_"
+        return "_Not yet indexed_"
     if entry.primary_mr is None:
         return "_No MR found_"
     mr = entry.primary_mr
@@ -187,16 +187,27 @@ def format_blame_comment(
         suspect_line = "_Could not identify a primary suspect with sufficient confidence._"
 
     orbit_miss_note = ""
-    if chain.orbit_misses > 0:
+    if 0 < chain.orbit_misses < chain.frames_analyzed:
         orbit_miss_note = (
-            f"\n> ⚠️ {chain.orbit_misses} frame(s) had no Orbit data "
-            "(code may be too new, not on default branch, or outside the indexed group).\n"
+            f"\n> ⚠️ {chain.orbit_misses} of {chain.frames_analyzed} frame(s) not yet indexed in Orbit "
+            "(code may be too new or on a non-default branch).\n"
         )
 
     table = _build_table(chain)
-    mermaid_chain = _build_mermaid_chain(chain, event)
     analysis_section = _build_analysis(chain, event)
     security_section = _build_security_section(chain)
+
+    blame_graph = ""
+    if chain.orbit_misses < chain.frames_analyzed:
+        mermaid_chain = _build_mermaid_chain(chain, event)
+        blame_graph = f"""
+<details>
+<summary>Blame graph (click to expand)</summary>
+
+{mermaid_chain}
+
+</details>
+"""
 
     mentions = _collect_mentions(chain, config)
     loop_in = ""
@@ -209,24 +220,15 @@ def format_blame_comment(
 
     return f"""## 🔗 RootChain SDLC Blame Analysis
 
-**Analyzed:** {ts} UTC
-**Error:** {error_summary}
-**Frames analyzed:** {chain.frames_analyzed} (filtered from {chain.frames_total} total)
-**Primary suspect:** {suspect_line}
+**Analyzed:** {ts} UTC · **Error:** {error_summary}
+**Frames analyzed:** {chain.frames_analyzed} (filtered from {chain.frames_total}) · **Primary suspect:** {suspect_line}
 
 ---
 
 ### Stack Trace → SDLC Chain
 
 {table}
-
-<details>
-<summary>Blame graph (click to expand)</summary>
-
-{mermaid_chain}
-
-</details>
-
+{blame_graph}
 ---
 {orbit_miss_note}
 ### Analysis
@@ -240,88 +242,109 @@ def format_blame_comment(
 [Report false positive]({fp_link})</sub>"""
 
 
+def _error_type_hint(error_type: str) -> str:
+    et = error_type.lower()
+    if any(k in et for k in ("null", "none", "nilpointer", "npe", "attributeerror")):
+        return (
+            "Look for unguarded nil/null dereferences — a recent change may now return null "
+            "where the code assumed it never would."
+        )
+    if any(k in et for k in ("type", "classcast")):
+        return (
+            "Check for type mismatches — a recent change may have altered a return type or "
+            "removed a field that callers still expect."
+        )
+    if any(k in et for k in ("index", "bounds", "keyerror", "nosuchelement")):
+        return (
+            "Check boundary conditions — a recent change may have altered collection sizes, "
+            "map keys, or off-by-one assumptions."
+        )
+    if any(k in et for k in ("timeout", "deadline", "context")):
+        return (
+            "Look for new I/O calls added to the hot path that push past downstream timeout budgets."
+        )
+    if any(k in et for k in ("permission", "auth", "forbidden", "unauthorized")):
+        return (
+            "Check whether auth guards or middleware order changed — a missing decorator or "
+            "wrong scope may have been introduced."
+        )
+    if any(k in et for k in ("memory", "oom", "outofmemory", "stackoverflow")):
+        return (
+            "Profile allocations — the change may have introduced an unbounded accumulation, "
+            "a large buffered response, or unintentional recursion."
+        )
+    if any(k in et for k in ("panic", "segfault", "sigsegv", "signal")):
+        return (
+            "Examine unsafe blocks or raw pointer arithmetic. "
+            "Check for use-after-free or data races if concurrency changed."
+        )
+    return "Analyze the root cause and suggest a minimal, targeted fix."
+
+
+def _build_ai_prompt(chain: BlameChain, event: SentryEvent) -> str:
+    top = chain.entries[0] if chain.entries else None
+    if not top:
+        return ""
+
+    frame = top.frame
+    parts: list[str] = [f"Fix a `{event.error_type}`"]
+    if event.error_message:
+        parts.append(f"with message `{event.error_message}`")
+    parts.append(f"in `{frame.file_path}` at line {frame.line_number}.")
+
+    if top.primary_mr and not top.history.orbit_miss:
+        mr = top.primary_mr
+        parts.append(
+            f"The most recent change to this file was MR !{mr.iid} "
+            f"by @{mr.author_username}, merged {mr.days_since_merge} days ago."
+        )
+        if mr.linked_issues:
+            parts.append(f"That MR was part of: {mr.linked_issues[0].title}.")
+
+    parts.append(_error_type_hint(event.error_type))
+    prompt_text = " ".join(parts)
+
+    return f"**Fix with AI:**\n\n> {prompt_text}"
+
+
 def _build_analysis(chain: BlameChain, event: SentryEvent) -> str:
+    ai_prompt = _build_ai_prompt(chain, event)
+
     if not chain.primary_suspect or chain.primary_suspect.primary_mr is None:
         all_miss = all(e.history.orbit_miss for e in chain.entries)
         if all_miss:
-            return (
-                "RootChain could not find Orbit data for any stack frame. "
-                "This typically means the code is very new (< 1h since merge), "
-                "on a non-default branch, or outside the configured group. "
-                "Enable `ROOTCHAIN_LOG_LEVEL=DEBUG` to inspect Orbit query responses."
+            body = (
+                "No SDLC history found for these files. This typically means the code was merged "
+                "recently (Orbit indexes within ~1 hour of merge), lives on a non-default branch, "
+                "or is in a project not yet connected to Orbit. "
+                "Re-running this analysis once the files are indexed will surface the causal MR."
             )
-        return (
-            "RootChain could not identify a primary suspect above the confidence threshold. "
-            "The blame table above shows all frames with partial data. "
-            "Review the frames manually or lower `ROOTCHAIN_CONFIDENCE_THRESHOLD`."
-        )
+        else:
+            body = (
+                "No single MR met the confidence threshold. "
+                "The blame table above shows all frames with partial data — "
+                "review the highest-confidence rows manually."
+            )
+        return f"{body}\n\n{ai_prompt}" if ai_prompt else body
 
     suspect = chain.primary_suspect
     mr = suspect.primary_mr
     frame = suspect.frame
     assert mr is not None
 
-    intent = ""
     if mr.linked_issues:
         issue = mr.linked_issues[0]
-        intent = (
-            f"MR !{mr.iid} was linked to issue #{issue.iid} ({issue.title}). "
-        )
+        intent = f"[MR !{mr.iid}]({mr.web_url}) was linked to [#{issue.iid}: {issue.title}]({issue.web_url}). "
     else:
-        intent = f"MR !{mr.iid} ({mr.title}) has no linked issue. "
+        intent = f"[MR !{mr.iid}]({mr.web_url}) ({mr.title}) has no linked issue. "
 
     suggestion = (
         f"**Suggested investigation:** Review `{frame.file_path}` around line {frame.line_number}, "
         f"specifically changes introduced in [MR !{mr.iid}]({mr.web_url}). "
-        f"{_error_type_hint(event.error_type, frame.function_name)}"
+        f"{_error_type_hint(event.error_type)}"
     )
 
-    return f"{intent}{suggestion}"
-
-
-def _error_type_hint(error_type: str, function_name: str) -> str:
-    """Return a short, error-type-specific investigation hint."""
-    et = error_type.lower()
-    fn = f"`{function_name}`"
-    if any(k in et for k in ("null", "none", "nilpointer", "npe")):
-        return (
-            f"Look for unguarded nil/null dereferences in {fn}: a dependency "
-            "may now return null where the MR assumed it never would."
-        )
-    if any(k in et for k in ("type", "classcast", "attributeerror")):
-        return (
-            f"Check argument types passed to {fn}: the MR may have changed a "
-            "return type or removed a field that callers still expect."
-        )
-    if any(k in et for k in ("index", "bounds", "keyerror", "nosuchelement")):
-        return (
-            f"Check boundary conditions in {fn}: the MR may have changed "
-            "collection sizes, map keys, or off-by-one assumptions."
-        )
-    if any(k in et for k in ("timeout", "deadline", "context")):
-        return (
-            f"Look for new I/O calls or locks added to {fn} in this MR that "
-            "extend the hot path and push past downstream timeout budgets."
-        )
-    if any(k in et for k in ("permission", "auth", "forbidden", "unauthorized")):
-        return (
-            f"Check whether the MR changed auth guards or middleware order around {fn}: "
-            "a missing decorator or wrong scope may have been introduced."
-        )
-    if any(k in et for k in ("memory", "oom", "outofmemory", "stackoverflow")):
-        return (
-            f"Profile allocation in {fn}: the MR may have introduced an unbounded "
-            "accumulation, a large buffered response, or unintentional recursion."
-        )
-    if any(k in et for k in ("panic", "segfault", "sigsegv", "signal")):
-        return (
-            f"Examine unsafe blocks or raw pointer arithmetic added to {fn} in this MR. "
-            "Check for use-after-free or data races if concurrency changed."
-        )
-    return (
-        f"Check whether the `{error_type}` scenario was tested for {fn} "
-        "before this MR was merged — the change may have introduced an unhandled path."
-    )
+    return f"{intent}{suggestion}\n\n{ai_prompt}" if ai_prompt else f"{intent}{suggestion}"
 
 
 def format_no_stack_trace_comment(event_title: str) -> str:
