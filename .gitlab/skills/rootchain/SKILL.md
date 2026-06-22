@@ -392,6 +392,17 @@ specifically the changes introduced in [MR !{iid}]({url}).
 
 ---
 
+## Tool Names (exact)
+
+Use these exact tool names — wrong names will be reported as unavailable:
+
+| Action | Tool name |
+|--------|-----------|
+| Read issue | `get_issue` |
+| Post analysis comment | `create_issue_note` |
+| Add label | `update_issue` (with `add_labels` field) |
+| Query Orbit | `query_graph` |
+
 ## What NOT to Do
 
 - Do not modify the original issue description. Only add notes (comments) and labels.
@@ -402,3 +413,4 @@ specifically the changes introduced in [MR !{iid}]({url}).
 - Do not fabricate a "primary suspect" if confidence is below 0.4.
 - Stop immediately if the issue already has the label `rootchain-analyzed`.
 - Do not expose the GitLab token or any secret in the comment.
+- Do not use `create_note` or `add_label` — those are not valid tool names.
