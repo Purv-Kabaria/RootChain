@@ -1,8 +1,8 @@
-"""Orbit REST API client — async, with retries, caching, and fallback queries.
+"""Async Orbit REST API client with retries, caching, and multi-strategy MR discovery.
 
-Uses the Orbit JSON DSL (POST /api/v4/orbit/query) with query_type values:
-traversal, neighbors, aggregation, path_finding.
-Never string-interpolates user input into queries.
+Queries the Orbit JSON DSL at POST /api/v4/orbit/query. All filter values are passed
+as typed parameters — never string-interpolated — to avoid injection and Orbit's
+strict filter-key validation.
 """
 
 from __future__ import annotations
@@ -28,9 +28,6 @@ from .models import (
 log = structlog.get_logger()
 
 
-# ---------------------------------------------------------------------------
-# Response normalization helpers
-# ---------------------------------------------------------------------------
 
 
 def _parse_merged_at(raw: str | None) -> datetime | None:
@@ -125,9 +122,6 @@ def _extract_mr_enrichment(
     return linked, reviewers, pipeline_status
 
 
-# ---------------------------------------------------------------------------
-# OrbitClient
-# ---------------------------------------------------------------------------
 
 
 class OrbitClient:
@@ -155,9 +149,6 @@ class OrbitClient:
     async def __aexit__(self, *_: object) -> None:
         await self.close()
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     async def get_symbol_histories(
         self, frames: list[StackFrame]
@@ -180,9 +171,6 @@ class OrbitClient:
                 histories.append(result)  # type: ignore[arg-type]
         return histories
 
-    # ------------------------------------------------------------------
-    # Internal query methods
-    # ------------------------------------------------------------------
 
     async def _get_symbol_history_cached(self, frame: StackFrame) -> SymbolHistory:
         cache_key = (frame.function_name, frame.file_path)
@@ -350,7 +338,7 @@ class OrbitClient:
             encoded_project = self._config.project_path.replace("/", "%2F")
             commits_r = await self._client.get(
                 f"/api/v4/projects/{encoded_project}/repository/commits",
-                params={"path": file_path, "ref_name": "main", "per_page": 10},
+                params={"path": file_path, "ref_name": self._config.default_branch, "per_page": 10},
             )
             if commits_r.status_code != 200:
                 return []
@@ -397,9 +385,6 @@ class OrbitClient:
             log.warning("commits_api_fallback_failed", file_path=file_path, exc=str(exc))
             return []
 
-    # ------------------------------------------------------------------
-    # JSON DSL primitives
-    # ------------------------------------------------------------------
 
     async def _traverse(
         self, entity: str, filters: dict, limit: int = 10  # type: ignore[type-arg]
@@ -470,7 +455,8 @@ class OrbitClient:
             )
             return []
 
-        return body.get("result", {}).get("nodes", [])
+        result = body.get("result") or {}
+        return result.get("nodes", [])
 
     @staticmethod
     def _orbit_miss(frame: StackFrame) -> SymbolHistory:
@@ -483,9 +469,6 @@ class OrbitClient:
             fallback_used=False,
         )
 
-    # ------------------------------------------------------------------
-    # Health check
-    # ------------------------------------------------------------------
 
     async def check_health(self) -> Result[str]:
         """Verify Orbit is reachable and healthy on the configured GitLab instance."""

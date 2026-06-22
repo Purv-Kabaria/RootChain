@@ -1,4 +1,4 @@
-"""All Pydantic v2 data models for RootChain. No imports from other src files."""
+"""All Pydantic v2 data models."""
 
 from __future__ import annotations
 
@@ -12,33 +12,19 @@ from pydantic import BaseModel, ConfigDict
 T = TypeVar("T")
 
 
-# ---------------------------------------------------------------------------
-# Result type for fallible operations
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class Ok(Generic[T]):
-    """Successful result wrapping a value."""
-
     value: T
 
 
 @dataclass
 class Err:
-    """Failed result with diagnostics."""
-
     message: str
     code: str
     retryable: bool = False
 
 
 type Result[T] = Ok[T] | Err
-
-
-# ---------------------------------------------------------------------------
-# Language enum
-# ---------------------------------------------------------------------------
 
 
 class Language(str, Enum):
@@ -52,14 +38,7 @@ class Language(str, Enum):
     UNKNOWN = "unknown"
 
 
-# ---------------------------------------------------------------------------
-# Sentry parsing models
-# ---------------------------------------------------------------------------
-
-
 class StackFrame(BaseModel):
-    """A single frame from a Sentry stack trace."""
-
     model_config = ConfigDict(frozen=True)
 
     file_path: str
@@ -72,8 +51,6 @@ class StackFrame(BaseModel):
 
 
 class SentryEvent(BaseModel):
-    """Parsed Sentry event extracted from a GitLab issue description."""
-
     model_config = ConfigDict(frozen=True)
 
     error_type: str
@@ -82,17 +59,10 @@ class SentryEvent(BaseModel):
     environment: str | None
     frames: list[StackFrame]
     sentry_issue_url: str | None
-    raw_frame_count: int = 0  # total frames before library filtering
-
-
-# ---------------------------------------------------------------------------
-# Orbit query result models
-# ---------------------------------------------------------------------------
+    raw_frame_count: int = 0
 
 
 class LinkedIssue(BaseModel):
-    """A GitLab work item (issue) linked to a merge request."""
-
     model_config = ConfigDict(frozen=True)
 
     iid: int
@@ -102,20 +72,16 @@ class LinkedIssue(BaseModel):
 
 
 class VulnerabilityFinding(BaseModel):
-    """An active security vulnerability from Orbit's security domain affecting a file."""
-
     model_config = ConfigDict(frozen=True)
 
     name: str
     severity: str  # "critical" | "high" | "medium" | "low" | "info" | "unknown"
     state: str     # "detected" | "confirmed" | "dismissed" | "resolved"
-    report_type: str  # "sast" | "dast" | "dependency_scanning" | etc.
+    report_type: str
     web_url: str
 
 
 class MRContext(BaseModel):
-    """A merge request with full context: linked issues, reviewers, recency."""
-
     model_config = ConfigDict(frozen=True)
 
     iid: int
@@ -131,27 +97,18 @@ class MRContext(BaseModel):
 
 
 class SymbolHistory(BaseModel):
-    """Orbit query result for a single stack frame symbol."""
-
     model_config = ConfigDict(frozen=True)
 
     function_name: str
     file_path: str
     recent_mrs: list[MRContext]
     caller_count: int
-    orbit_miss: bool  # True when Orbit returned no results at all
-    fallback_used: bool  # True when file-level fallback was used instead of definition-level
-    security_findings: list[VulnerabilityFinding] = []  # Active CVEs/vulns in this file
-
-
-# ---------------------------------------------------------------------------
-# Blame chain models
-# ---------------------------------------------------------------------------
+    orbit_miss: bool
+    fallback_used: bool
+    security_findings: list[VulnerabilityFinding] = []
 
 
 class BlameEntry(BaseModel):
-    """One ranked entry in the blame chain, pairing a frame with its Orbit history."""
-
     model_config = ConfigDict(frozen=True)
 
     frame: StackFrame
@@ -163,8 +120,6 @@ class BlameEntry(BaseModel):
 
 
 class BlameChain(BaseModel):
-    """The full ranked blame chain for a Sentry event."""
-
     model_config = ConfigDict(frozen=True)
 
     entries: list[BlameEntry]
