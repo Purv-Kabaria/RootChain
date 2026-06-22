@@ -419,12 +419,25 @@ class OrbitClient:
     async def _run_with_retry(
         self, payload: dict  # type: ignore[type-arg]
     ) -> list[dict]:  # type: ignore[type-arg]
-        """Execute an Orbit JSON DSL query payload with retry. Returns flat node list."""
+        """Execute an Orbit JSON DSL query payload with retry.
+
+        Sends the payload to ``POST /api/v4/orbit/query`` and returns the flat
+        list of node dicts from the ``result.nodes`` field.
+
+        Return values:
+        - Empty list on 4xx errors, Orbit error bodies, or empty results.
+        - Raises on 5xx or network failures (tenacity retries 3 times).
+
+        The Orbit API contract guarantees ``result`` is always a dict when the
+        request succeeds — ``result.get("nodes", [])`` is always safe.
+        """
         t0 = time.monotonic()
         response = await self._client.post("/api/v4/orbit/query", json=payload)
 
         elapsed = int((time.monotonic() - t0) * 1000)
         log.debug("orbit_http_response", status=response.status_code, elapsed_ms=elapsed)
+
+        log.debug("orbit_response_bytes", size=len(response.content))
 
         if response.status_code == 429:
             retry_after = int(response.headers.get("Retry-After", "5"))
@@ -455,8 +468,9 @@ class OrbitClient:
             )
             return []
 
-        result = body.get("result") or {}
-        return result.get("nodes", [])
+        # Orbit API contract: result is always a mapping when present.
+        # Use default {} so absent key and None both resolve to empty.
+        return body.get("result", {}).get("nodes", [])
 
     @staticmethod
     def _orbit_miss(frame: StackFrame) -> SymbolHistory:
