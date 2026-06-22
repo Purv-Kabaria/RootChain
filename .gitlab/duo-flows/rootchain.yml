@@ -27,8 +27,8 @@ components:
     toolset:
       - get_issue
       - query_graph
-      - create_note
-      - add_label
+      - create_issue_note
+      - update_issue
     ui_log_events:
       - "on_agent_final_answer"
       - "on_tool_execution_success"
@@ -50,11 +50,14 @@ prompts:
         ## CRITICAL RULE 2 — Always call the tools, never describe them
 
         After your analysis you MUST:
-        - Actually CALL create_note with the full Markdown comment
-        - Actually CALL add_label with "rootchain-analyzed"
+        - Actually CALL create_issue_note with the full Markdown comment body
+        - Actually CALL update_issue with add_labels="rootchain-analyzed"
+
+        The tools are: create_issue_note (adds a note to an issue) and update_issue
+        (updates issue fields — use add_labels to add a label).
 
         NEVER say "I would post" or "the label would be applied". Just call the tools.
-        Even if ALL frames are orbit_miss, still call create_note and add_label.
+        Even if ALL frames are orbit_miss, still call create_issue_note and update_issue.
         If query_graph is unavailable or errors — mark those frames orbit_miss and
         continue. orbit_miss is a valid result. Post the comment regardless.
 
@@ -88,9 +91,9 @@ prompts:
 
         Take the top 5 surviving frames.
 
-        If zero frames survive: call create_note with
+        If zero frames survive: call create_issue_note with body
         "RootChain: No parseable stack trace found in this issue." then call
-        add_label "rootchain-analyzed" and stop.
+        update_issue with add_labels="rootchain-analyzed" and stop.
 
         ## Step 2 — Query Orbit for each frame (JSON DSL, NOT Cypher)
 
@@ -159,7 +162,7 @@ prompts:
         Deduplicate: same mr.iid → keep higher confidence entry.
         Primary suspect = highest score ≥ 0.4.
 
-        ## Step 7 — Call create_note with this Markdown
+        ## Step 7 — Call create_issue_note with this Markdown body
 
         ## 🔗 RootChain SDLC Blame Analysis
 
@@ -215,7 +218,7 @@ prompts:
         - Never backticks inside table cells
         - @mention at most 3 unique users
 
-        ## Step 8 — Call add_label with "rootchain-analyzed"
+        ## Step 8 — Call update_issue with add_labels="rootchain-analyzed"
 
         ## Absolute rules
 
@@ -225,6 +228,7 @@ prompts:
         - NEVER analyze more than 5 frames
         - NEVER use Cypher — always JSON DSL
         - NEVER describe what you are about to do — just call the tools
+        - ALWAYS use create_issue_note (not create_note) and update_issue (not add_label)
 
       user: |
         Project ID: {{project_id}}
