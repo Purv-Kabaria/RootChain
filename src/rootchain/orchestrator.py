@@ -127,7 +127,21 @@ async def _analyze(
 
     bound_log.info("frames_to_analyze", count=len(event.frames))
 
-    histories = await orbit.get_symbol_histories(list(event.frames))
+    try:
+        async with asyncio.timeout(config.analysis_timeout_seconds):
+            histories = await orbit.get_symbol_histories(list(event.frames))
+    except TimeoutError:
+        bound_log.warning(
+            "orbit_timeout",
+            timeout_seconds=config.analysis_timeout_seconds,
+            frames=len(event.frames),
+        )
+        comment = format_all_library_frames_comment(len(event.frames))
+        if dry_run:
+            print(comment)
+            return
+        await _post_and_label(gitlab, project_path, issue_iid, comment, config, bound_log)
+        return
 
     chain = build_blame_chain(event, histories, config)
 

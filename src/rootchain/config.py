@@ -56,6 +56,9 @@ class Config:
     orbit_max_retries: int = 3
     orbit_retry_base_seconds: int = 2
 
+    # Analysis pipeline
+    analysis_timeout_seconds: int = 45
+
     # Parsing
     max_frames: int = 5
     include_library_frames: bool = False
@@ -95,6 +98,7 @@ class Config:
             orbit_timeout_seconds=_int_env("ROOTCHAIN_ORBIT_TIMEOUT_SECONDS", 30),
             orbit_max_retries=_int_env("ROOTCHAIN_ORBIT_MAX_RETRIES", 3),
             orbit_retry_base_seconds=_int_env("ROOTCHAIN_ORBIT_RETRY_BASE_SECONDS", 2),
+            analysis_timeout_seconds=_int_env("ROOTCHAIN_ANALYSIS_TIMEOUT_SECONDS", 45),
             max_frames=_int_env("ROOTCHAIN_MAX_FRAMES", 5),
             include_library_frames=_bool_env("ROOTCHAIN_INCLUDE_LIBRARY_FRAMES", False),
             confidence_threshold=_float_env("ROOTCHAIN_CONFIDENCE_THRESHOLD", 0.4),
