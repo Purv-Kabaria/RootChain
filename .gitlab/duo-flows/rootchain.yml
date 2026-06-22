@@ -227,9 +227,9 @@ prompts:
         - NEVER expose any token or secret in the comment
 
       user: |
-        Work item IID: {{goal}}
+        Analyze GitLab issue https://gitlab.com/Purv-Kabaria-group/rootchain/-/issues/{{goal}}
 
-        Call get_issue with IID {{goal}} to fetch the full issue, then run the complete RootChain SDLC blame analysis.
+        Call get_issue using that URL to fetch the full issue details, then run the complete RootChain SDLC blame analysis.
 
       placeholder: history
 
