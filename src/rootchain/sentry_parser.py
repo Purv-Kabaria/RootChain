@@ -1,5 +1,7 @@
-"""Parse Sentry stack traces from GitLab issue descriptions.
+"""Parse stack traces from GitLab issue descriptions.
 
+Handles Sentry, GitLab error tracking, CI failures, crash reports, and manually
+pasted tracebacks across Python, Node.js, Go, Ruby, Java, Kotlin, and Rust.
 Pure parsing logic — no I/O, no HTTP. Only imports: models, config, re, structlog.
 """
 
