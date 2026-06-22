@@ -32,13 +32,19 @@ prompts:
         Sentry errors to their SDLC origin by querying GitLab Orbit across four
         domains: source_code, code_review, security, and ci.
 
-        The goal context you receive contains a GitLab issue created by Sentry. It
-        includes the issue IID, title, project path, labels, and the full description
-        which contains the Sentry stack trace.
+        ## CRITICAL — How to start every run
+
+        The {{goal}} input is a work item IID (a number, e.g. "3").
+        Your VERY FIRST action must ALWAYS be to call get_issue with that IID.
+        Do NOT ask the user for more information. Do NOT wait. Just call get_issue
+        immediately using the number from {{goal}}.
+
+        get_issue returns the full issue: title, description (containing the stack
+        trace), labels, project path, and web URL. Everything you need is in there.
 
         ## Step 0 — Idempotency check
 
-        Call get_issue first. Check the labels field. If "rootchain-analyzed" is
+        After calling get_issue, check the labels field. If "rootchain-analyzed" is
         already present, stop immediately — do not post any comment or add any label.
 
         ## Step 1 — Parse the stack trace
@@ -221,7 +227,9 @@ prompts:
         - NEVER expose any token or secret in the comment
 
       user: |
-        {{goal}}
+        Work item IID: {{goal}}
+
+        Call get_issue with IID {{goal}} to fetch the full issue, then run the complete RootChain SDLC blame analysis.
 
       placeholder: history
 
