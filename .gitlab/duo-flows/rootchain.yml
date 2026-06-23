@@ -27,6 +27,7 @@ components:
     toolset:
       - get_issue
       - query_graph
+      - gitlab_api_get
       - create_issue_note
       - update_issue
     ui_log_events:
@@ -97,72 +98,36 @@ prompts:
 
         ## Step 2 — Query Orbit for each frame (JSON DSL, NOT Cypher)
 
-        Use query_graph with the raw query object. Do not wrap it in another
-        {"query": ...} envelope when calling the tool. REST API calls use the
-        envelope, but query_graph receives the query body directly.
-
-        Orbit response: key is "result" (not "data"), properties are FLAT on the node.
-        iid may be a string — always cast to int. If web_url absent: construct it.
+        Use query_graph with the raw query object. Do not wrap it in another {"query": ...} envelope.
 
         Always scope MR lookups to the project full path from get_issue.
 
-        Strategy cascade per frame (stop at first that returns MR nodes):
+        Strategy cascade per frame (stop at first that returns MergeRequest nodes):
 
-        A) Current diff traversal with old_path (preferred historical lookup):
-           {"query_type": "traversal",
-            "nodes": [
-              {"id": "project", "entity": "Project",
-               "filters": {"full_path": "<project_full_path>"},
-               "columns": ["id", "full_path"]},
-              {"id": "mr", "entity": "MergeRequest",
-               "filters": {"state": "merged"},
-               "columns": ["id", "iid", "title", "description", "state", "merged_at"]},
-              {"id": "snapshot", "entity": "MergeRequestDiff", "columns": ["id"]},
-              {"id": "file", "entity": "MergeRequestDiffFile",
-               "filters": {"old_path": "<file_path>"},
-               "columns": ["old_path", "new_path"]}
-            ],
-            "relationships": [
-              {"type": "IN_PROJECT", "from": "mr", "to": "project"},
-              {"type": "HAS_DIFF", "from": "mr", "to": "snapshot"},
-              {"type": "HAS_FILE", "from": "snapshot", "to": "file"}
-            ],
-            "limit": 25}
-           Filter for type="MergeRequest" where merged_at present or state="merged".
-           Sort by merged_at descending and keep the top 3.
-
-        B) Same traversal with new_path (rename-specific fallback):
-           Same as A but filters: {"new_path": "<file_path>"}.
-           If this is the only hit: set fallback_used=true (confidence Ã— 0.7).
-
-        C) Legacy File neighbors:
-           {"query_type": "neighbors", "node": {"id": "n", "entity": "File",
-            "filters": {"path": "<file_path>"}}, "neighbors": {"node": "n"}}
-           Filter for type="MergeRequest" where merged_at present or state="merged".
-
-        D) Legacy MergeRequestDiffFile neighbors:
-           {"query_type": "neighbors", "node": {"id": "n",
-            "entity": "MergeRequestDiffFile", "filters": {"new_path": "<file_path>"}},
-            "neighbors": {"node": "n"}}
-
-        E) Legacy old_path neighbor fallback:
-           Same as B but filters: {"old_path": "<file_path>"}
-           If this is the only hit: set fallback_used=true (confidence × 0.7)
-
-        F) CDC-Lag Semantic Fallback (When file edges are missing):
-           If A-E return 0 MR nodes, query the project's recent MRs directly:
+        A) Schema-Aligned Traversal with old_path:
            {"query_type": "traversal",
             "nodes": [
               {"id": "project", "entity": "Project", "filters": {"full_path": "<project_full_path>"}, "columns": ["id"]},
-              {"id": "mr", "entity": "MergeRequest", "filters": {"state": "merged"}, "columns": ["id", "iid", "title", "description", "state", "merged_at", "author_username"]}
+              {"id": "mr", "entity": "MergeRequest", "columns": ["id", "iid", "title"]},
+              {"id": "snapshot", "entity": "MergeRequestDiff", "columns": ["id"]},
+              {"id": "file", "entity": "MergeRequestDiffFile", "filters": {"old_path": "<file_path>"}, "columns": ["old_path", "new_path"]}
             ],
             "relationships": [
-              {"type": "IN_PROJECT", "from": "mr", "to": "project"}
+              {"type": "SOURCE_PROJECT", "from": "project", "to": "mr"},
+              {"type": "HAS_DIFF", "from": "snapshot", "to": "mr"},
+              {"type": "HAS_FILE", "from": "file", "to": "snapshot"}
             ],
-            "limit": 5}
-           Sort the results by merged_at descending. Read the MR descriptions. If an MR's technical intent directly explains the runtime error (e.g., an MR implementing "batching" causing a "complexity threshold" error), assign that MR as the culprit. Set confidence to HIGH (0.90) and note that this was a semantic match due to indexing lag.
+            "limit": 10}
+           Keep all returned MergeRequest nodes. Do NOT filter them based on missing fields like merged_at.
 
-        0 MR nodes from all strategies (including F) → orbit_miss. Do NOT fabricate data.
+        B) Schema-Aligned Traversal with new_path:
+           Same as A but filters: {"new_path": "<file_path>"}.
+
+        C) Undirected Neighbors fallback:
+           {"query_type": "neighbors", "node": {"id": "n", "entity": "File", "filters": {"path": "<file_path>"}}, "neighbors": {"node": "n"}}
+           Extract any nodes with type "MergeRequest" from the result. Do NOT filter them out if merged_at or state is missing, as Orbit neighbor queries return sparse nodes.
+
+        0 MR nodes from all strategies → orbit_miss. Do NOT fabricate data.
 
         ## Step 3 — Enrich each MR (linked issues, reviewers, CI)
 
@@ -240,6 +205,12 @@ prompts:
         - NullPointerException → look for unguarded nil dereferences
         - TimeoutError → look for new I/O added on the hot path
         - PanicError → examine unsafe blocks or unguarded slice accesses
+
+        **Fix with AI:**
+        > You are an expert debugging assistant. I have a `{error_type}` in production with the message: `{message}`.
+        > The stack trace points to `{func}` in `{file}:{line}`.
+        > RootChain analysis shows this file was last modified by MR !{iid} (`{title}`).
+        > Please analyze the intent of that MR and provide a minimal, targeted code fix to resolve the error while preserving the MR's original goal. Provide the exact code diff.
 
         {IF CVEs found:}
         ### ⚠️ Security Context
