@@ -1,6 +1,6 @@
 # RootChain
 
-> One YAML file. Drop it in any GitLab project. When a production error lands as a GitLab issue, RootChain automatically traces the stack trace to the MR that introduced it — finding the causal change, its intent, and who to loop in — in under two minutes.
+> One YAML file. Drop it in any GitLab project. When a production error lands as a GitLab issue, RootChain automatically traces the stack trace to the MR that introduced it - finding the causal change, its intent, and who to loop in - in under two minutes.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![GitLab Duo](https://img.shields.io/badge/GitLab-Duo%20Agent%20Platform-orange)](https://docs.gitlab.com/user/duo_agent_platform/)
@@ -11,33 +11,30 @@
 
 ## The Problem
 
-A production error fires at 2am. Your on-call engineer opens the alert, sees a stack trace, and spends the next 30–90 minutes doing archaeology: `git blame`, grepping closed issues, finding the MR that introduced the change, messaging the author. The answer has been sitting inside GitLab the whole time — in the MR that changed the function, in the issue that motivated it, in the reviewer who approved it — just disconnected from the runtime signal.
+A production error fires at 2am. Your on-call engineer opens the alert, sees a stack trace, and spends the next 30-90 minutes doing archaeology: `git blame`, grepping closed issues, finding the MR that introduced the change, messaging the author. The answer has been sitting inside GitLab the whole time - in the MR that changed the function, in the issue that motivated it, in the reviewer who approved it - just disconnected from the runtime signal.
 
 **RootChain closes that gap.**
 
-When an error lands as a GitLab issue — from Sentry, GitLab error tracking, a CI failure, a crash report, or a manually filed bug — RootChain's Duo Agent Platform flow activates automatically. It parses the stack trace, queries GitLab Orbit for the SDLC history of each frame, and posts a structured blame-chain analysis directly to the issue.
+When an error lands as a GitLab issue - from Sentry, GitLab error tracking, a CI failure, a crash report, or a manually filed bug - RootChain's Duo Agent Platform flow activates automatically. It parses the stack trace, queries GitLab Orbit for the SDLC history of each frame, and posts a structured blame-chain analysis directly to the issue.
 
 **What engineers see when they open the issue:**
 
 ```markdown
-## 🔗 RootChain SDLC Blame Analysis
+## RootChain SDLC Blame Analysis
 
-**Error:** `AttributeError: 'NoneType' object has no attribute 'get'`
-**Primary suspect:** MR !342 by @alice · 4 days ago
+**Error:** `RootChainLowSignalAnalysis: all frames resolved to orbit_miss despite indexed Orbit data`
+**Primary suspect:** MR !2 by @Purv-Kabaria - 0 days ago
 
 | # | Function | File | Last MR | Intent | Author | Confidence |
 |---|----------|------|---------|--------|--------|------------|
-| 1 | _run_with_retry | orbit_client.py:473 | !342 · 4d ago · ✅ CI passed | #89: JSON DSL rewrite | @alice | 🔴 HIGH |
-| 2 | _find_mrs_for_file | orbit_client.py:243 | !342 · 4d ago | #89: JSON DSL rewrite | @alice | 🟡 MEDIUM |
+| 1 | _find_mrs_for_file | orbit_client.py:238 | !2 - 0d ago - CI failed | refactor: simplify Orbit response parsing, add bytes logging | @Purv-Kabaria | HIGH |
+| 2 | _analyze | orchestrator.py:132 | !3 - 0d ago - CI failed | feat: add configurable analysis timeout to orchestrator pipeline | @Purv-Kabaria | HIGH |
 
-MR !342 rewrote the Orbit query layer from Cypher to JSON DSL. The change at line 473
-uses `body.get("result", {})` which silently fails when Orbit returns `{"result": null}` —
-the null case was handled in the original implementation but lost during the rewrite.
+MR !2 changed RootChain's Orbit response parsing and diagnostics path. The failing frame is in the file lookup path, where neighbor-only lookups and `new_path` can miss useful history even though Orbit has project, file, and MR data indexed.
 
-**Suggested investigation:** Review `orbit_client.py` around line 473, specifically
-the `_run_with_retry` changes in MR !342.
+**Suggested investigation:** Replace the neighbor-only file lookup with project-scoped MR diff traversal using `old_path` first, then keep `new_path`, legacy neighbor queries, and REST fallbacks for coverage.
 
-**Loop in:** @alice · @bob
+**Loop in:** @Purv-Kabaria
 ```
 
 ---
@@ -46,23 +43,23 @@ the `_run_with_retry` changes in MR !342.
 
 ```
 Production error fires (Sentry / GitLab error tracking / CI failure / crash report)
-        │
-        ▼
+        |
+        v
 Error lands as a GitLab issue with a stack trace in the description
-        │
-        ▼
+        |
+        v
 work_item_created trigger activates the RootChain flow
-        │
-        ▼
+        |
+        v
 Flow reads the issue, parses the stack trace (Python / Node.js / Go / Ruby / Java / Rust)
-        │
-        ▼
-Orbit JSON DSL queries: File → MergeRequest → WorkItem + User + Pipeline
-        │
-        ▼
+        |
+        v
+Orbit JSON DSL queries: File -> MergeRequest -> WorkItem + User + Pipeline
+        |
+        v
 Agent builds a confidence-scored blame chain and posts it as a comment
-        │
-        ▼
+        |
+        v
 On-call engineer sees: primary suspect MR, intent, author, and a suggested fix path
 ```
 
@@ -72,12 +69,11 @@ Most Orbit use cases are forward queries: "what changed recently?" or "who owns 
 
 The key multi-hop path:
 ```
-AttributeError at runtime
-  → stack frame: _run_with_retry() in orbit_client.py
-  → Orbit: File[orbit_client.py] ← MergeRequest[!342]
-  → Orbit: MergeRequest[!342] → WorkItem[#89: "JSON DSL rewrite"]
-  → Orbit: MergeRequest[!342] ← User[@alice (author), @bob (reviewer)]
-  → Orbit: Definition[_run_with_retry] ← 7 other callers (blast radius)
+RootChainLowSignalAnalysis at runtime
+  -> stack frame: _find_mrs_for_file() in orbit_client.py
+  -> Orbit: File[orbit_client.py] <- MergeRequest[!2]
+  -> Orbit: MergeRequest[!2] -> author @Purv-Kabaria, CI status, diff files
+  -> RootChain ranks !2 above distractor MR !3 from the caller frame
 ```
 
 No individual hop is novel. What's novel is executing all hops automatically from a runtime error and **ranking** the results by a confidence formula that weighs recency, frame depth, and blast radius simultaneously.
@@ -254,21 +250,9 @@ file by `old_path`.
 MR diff files. `new_path` and the older neighbor-based queries remain as
 fallbacks.
 
-For each stack frame, `OrbitClient` runs a cascade of strategies — stopping at the first one that returns MR nodes:
+For each stack frame, `OrbitClient` runs a cascade of strategies — stopping at the first one that returns MR nodes. After the primary `old_path` traversal, fallbacks include `new_path` traversal for rename coverage, legacy neighbor queries, and the GitLab commits REST API.
 
-**Strategy 1 — File neighbors** (direct; fastest when indexed)
-```json
-{"query": {"query_type": "neighbors", "node": {"entity": "File", "filters": {"path": "src/my/file.py"}}, "neighbors": {"node": "n"}}}
-```
-
-**Strategy 2 — MergeRequestDiffFile** (one hop via diff record)
-```json
-{"query": {"query_type": "neighbors", "node": {"entity": "MergeRequestDiffFile", "filters": {"new_path": "src/my/file.py"}}, "neighbors": {"node": "n"}}}
-```
-
-**Strategy 3 — old_path fallback** (renamed files; applies a 0.7× confidence penalty)
-
-**Strategy 4 — GitLab commits REST API** (reliable fallback when Orbit graph edges aren't indexed yet)
+**GitLab commits REST API fallback** (reliable bridge when graph edges lag)
 ```
 GET /api/v4/projects/{id}/repository/commits?path={file}&ref_name=main
 → per commit SHA → GET .../commits/{sha}/merge_requests

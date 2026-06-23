@@ -59,5 +59,10 @@ fly.log
 node_modules/
 .playwright-mcp
 
-# Docs (local only — not version-controlled)
-docs/
+# Docs (local only, except demo/submission assets)
+docs/*
+!docs/
+!docs/demo_issue.md
+!docs/demo_script.md
+!docs/devpost_submission.md
+!docs/submission_guide.md

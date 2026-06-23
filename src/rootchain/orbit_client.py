@@ -356,6 +356,8 @@ class OrbitClient:
         neighbors = await self._get_neighbors("MergeRequest", {"iid": mr_iid})
         project_url = f"{self._config.gitlab_url}/{self._config.project_path}"
         linked, reviewers, pipeline_status = _extract_mr_enrichment(neighbors, project_url)
+        if not linked:
+            linked = await self._get_mr_closing_issues_rest(mr_iid)
 
         web_url = _node_str(mr_node, "web_url", "url") or str(rest_mr.get("web_url", ""))
         if not web_url and mr_iid:
@@ -403,6 +405,47 @@ class OrbitClient:
         except httpx.HTTPError as exc:
             log.warning("mr_rest_fetch_exception", mr_iid=mr_iid, exc=str(exc))
             return {}
+
+    async def _get_mr_closing_issues_rest(self, mr_iid: int) -> list[LinkedIssue]:
+        """Fetch issues closed by an MR when Orbit does not return WorkItem edges yet."""
+        if mr_iid <= 0:
+            return []
+        try:
+            encoded_project = self._config.project_path.replace("/", "%2F")
+            response = await self._client.get(
+                f"/api/v4/projects/{encoded_project}/merge_requests/{mr_iid}/closes_issues"
+            )
+            if response.status_code != 200:
+                log.warning(
+                    "mr_closing_issues_fetch_failed",
+                    mr_iid=mr_iid,
+                    status=response.status_code,
+                )
+                return []
+            body = response.json()
+            if not isinstance(body, list):
+                return []
+
+            issues: list[LinkedIssue] = []
+            for item in body[:3]:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    iid = int(item.get("iid", 0))
+                except (TypeError, ValueError):
+                    continue
+                if iid <= 0:
+                    continue
+                issues.append(LinkedIssue(
+                    iid=iid,
+                    title=str(item.get("title", "")),
+                    web_url=str(item.get("web_url", "")),
+                    state=str(item.get("state", "unknown")),
+                ))
+            return issues
+        except Exception as exc:
+            log.warning("mr_closing_issues_fetch_exception", mr_iid=mr_iid, exc=str(exc))
+            return []
 
     async def _get_caller_count(self, function_name: str) -> int:
         try:

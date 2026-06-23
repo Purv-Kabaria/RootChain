@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
 import os
-from datetime import datetime
+import sys
+from datetime import UTC, datetime
+from urllib.parse import quote
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -98,10 +99,69 @@ net/http.HandlerFunc.ServeHTTP(0x14000123456, 0x1400034f780, 0x14000305b40)
 ```
 """
 
+ROOTCHAIN_DEMO_DESCRIPTION = """\
+## RootChainLowSignalAnalysis: all frames returned orbit_miss
+
+**Service:** RootChain Duo flow
+**Environment:** GitLab.com project `purv-kabaria-group/rootchain`
+**Severity:** P1
+**First observed:** 2026-06-23 12:28 UTC
+**Detection source:** https://gitlab.com/purv-kabaria-group/rootchain/-/work_items/13
+**Flow session:** https://gitlab.com/purv-kabaria-group/rootchain/-/automate/agent-sessions/4660616
+
+### Impact
+
+RootChain is supposed to shorten incident triage by posting a ranked MR blame chain on
+new production error issues. Instead, an issue can be marked `rootchain-analyzed` while
+the output contains no actionable MR, author, or confidence signal.
+
+This is a high-risk silent failure mode for on-call: the automation appears to have run,
+but the engineer still has to manually inspect stack frames, search recent MRs, and infer
+which change caused the regression.
+
+### Evidence From The Live Project
+
+- Orbit is enabled and healthy for `purv-kabaria-group/rootchain`.
+- Orbit returns the project node for `purv-kabaria-group/rootchain`.
+- Orbit returns file nodes for `src/rootchain/orbit_client.py`.
+- Orbit returns merged MRs `!1`, `!2`, and `!3` in the project.
+- The old RootChain query shape still misses useful blame data for some frames because it
+  relies on direct neighbor lookups and `MergeRequestDiffFile.new_path`.
+- A project-scoped traversal through MR diff snapshots using `old_path` returns the real MR.
+
+### Stacktrace
+
+Sentry frame order is closest-to-error first.
+
+```text
+RootChainLowSignalAnalysis: all frames resolved to orbit_miss despite indexed Orbit data
+  File "src/rootchain/orbit_client.py", line 238, in _find_mrs_for_file
+    nodes = await self._get_neighbors("MergeRequestDiffFile", {{"new_path": file_path}})
+  File "src/rootchain/orbit_client.py", line 231, in _find_mrs_for_file
+    nodes = await self._get_neighbors("File", {{"path": file_path}})
+  File "src/rootchain/orbit_client.py", line 405, in _get_neighbors
+    return await self._run_with_retry({{...}})
+  File "src/rootchain/orchestrator.py", line 132, in _analyze
+    histories = await orbit.get_symbol_histories(list(event.frames))
+  File "src/rootchain/orchestrator.py", line 80, in run_analysis
+    await _analyze(...)
+```
+
+### Question for RootChain
+
+Identify the MR that changed RootChain's Orbit lookup behavior, explain the intent behind
+that change, and point to the smallest production-safe fix. The answer should use real
+GitLab/Orbit data, not guessed MR titles or authors.
+"""
+
 TEMPLATES = {
     "python": ("[Sentry] TypeError: 'NoneType' object is not subscriptable", PYTHON_DESCRIPTION),
     "node": ("[Sentry] ReferenceError: Cannot read properties of undefined", NODE_DESCRIPTION),
     "go": ("[Sentry] panic: runtime error: index out of range", GO_DESCRIPTION),
+    "rootchain-demo": (
+        "[P1] RootChain marks incidents analyzed but returns no useful Orbit blame data",
+        ROOTCHAIN_DEMO_DESCRIPTION,
+    ),
 }
 
 
@@ -112,11 +172,11 @@ async def create_issue(
     language: str,
 ) -> None:
     import httpx
-    from urllib.parse import quote
 
     title_template, desc_template = TEMPLATES[language]
-    ts = datetime.utcnow().isoformat() + "Z"
+    ts = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     description = desc_template.format(ts=ts)
+    gitlab_url = gitlab_url.rstrip("/")
 
     async with httpx.AsyncClient(
         base_url=f"{gitlab_url}/api/v4",
@@ -137,13 +197,13 @@ async def create_issue(
     print(f"     URL: {issue['web_url']}")
     print()
     print("The RootChain flow should activate within ~2 minutes.")
-    print("Watch: Project → Duo Agent Platform → Flows → rootchain → Logs")
+    print("Watch: Project -> Duo Agent Platform -> Flows -> rootchain -> Logs")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a test Sentry issue in GitLab")
     parser.add_argument(
-        "--language", choices=["python", "node", "go"], default="python",
+        "--language", choices=["python", "node", "go", "rootchain-demo"], default="python",
         help="Stack trace language to simulate"
     )
     parser.add_argument("--project-path", default=os.getenv("ROOTCHAIN_PROJECT_PATH"))
