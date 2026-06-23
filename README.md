@@ -226,6 +226,34 @@ python -m src.rootchain.orchestrator \
 
 ## How RootChain Finds the Causal MR
 
+Current primary lookup: a project-scoped Orbit traversal from Project to
+MergeRequest to MergeRequestDiff to MergeRequestDiffFile, filtering the diff
+file by `old_path`.
+
+```json
+{
+  "query": {
+    "query_type": "traversal",
+    "nodes": [
+      {"id": "project", "entity": "Project", "filters": {"full_path": "my-org/my-app"}},
+      {"id": "mr", "entity": "MergeRequest", "filters": {"state": "merged"}},
+      {"id": "snapshot", "entity": "MergeRequestDiff"},
+      {"id": "file", "entity": "MergeRequestDiffFile", "filters": {"old_path": "src/my/file.py"}}
+    ],
+    "relationships": [
+      {"type": "IN_PROJECT", "from": "mr", "to": "project"},
+      {"type": "HAS_DIFF", "from": "mr", "to": "snapshot"},
+      {"type": "HAS_FILE", "from": "snapshot", "to": "file"}
+    ],
+    "limit": 25
+  }
+}
+```
+
+`old_path` is used first because it is the stable historical lookup column for
+MR diff files. `new_path` and the older neighbor-based queries remain as
+fallbacks.
+
 For each stack frame, `OrbitClient` runs a cascade of strategies — stopping at the first one that returns MR nodes:
 
 **Strategy 1 — File neighbors** (direct; fastest when indexed)

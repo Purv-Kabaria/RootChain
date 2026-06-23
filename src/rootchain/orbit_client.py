@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 import structlog
@@ -22,7 +22,14 @@ from tenacity import (
 
 from .config import Config
 from .models import (
-    Err, LinkedIssue, MRContext, Ok, Result, StackFrame, SymbolHistory, VulnerabilityFinding,
+    Err,
+    LinkedIssue,
+    MRContext,
+    Ok,
+    Result,
+    StackFrame,
+    SymbolHistory,
+    VulnerabilityFinding,
 )
 
 log = structlog.get_logger()
@@ -34,7 +41,10 @@ def _parse_merged_at(raw: str | None) -> datetime | None:
     if not raw:
         return None
     try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=UTC)
+        return parsed
     except (ValueError, AttributeError):
         return None
 
@@ -42,7 +52,9 @@ def _parse_merged_at(raw: str | None) -> datetime | None:
 def _days_since(dt: datetime | None) -> int:
     if dt is None:
         return 0
-    return (datetime.now(timezone.utc) - dt).days
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return (datetime.now(UTC) - dt).days
 
 
 def _node_str(node: dict, *keys: str, default: str = "") -> str:
@@ -143,7 +155,7 @@ class OrbitClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def __aenter__(self) -> "OrbitClient":
+    async def __aenter__(self) -> OrbitClient:
         return self
 
     async def __aexit__(self, *_: object) -> None:
@@ -158,7 +170,7 @@ class OrbitClient:
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         histories: list[SymbolHistory] = []
-        for frame, result in zip(frames, results):
+        for frame, result in zip(frames, results, strict=True):
             if isinstance(result, Exception):
                 log.error(
                     "symbol_history_exception",
@@ -228,6 +240,16 @@ class OrbitClient:
     async def _find_mrs_for_file(self, file_path: str) -> tuple[list[dict], bool]:
         """Multi-strategy MR discovery for a file. Returns (mr_nodes, fallback_used)."""
         # Strategy 1: Direct neighbors of File node (if Orbit has File→MR edges)
+        mrs = await self._find_mrs_via_diff_traversal(file_path, path_field="old_path")
+        if mrs:
+            log.debug("orbit_diff_traversal_old_path_hit", file_path=file_path, count=len(mrs))
+            return mrs[:3], False
+
+        mrs = await self._find_mrs_via_diff_traversal(file_path, path_field="new_path")
+        if mrs:
+            log.debug("orbit_diff_traversal_new_path_hit", file_path=file_path, count=len(mrs))
+            return mrs[:3], True
+
         nodes = await self._get_neighbors("File", {"path": file_path})
         mrs = _filter_merged_mrs(nodes)
         if mrs:
@@ -271,28 +293,87 @@ class OrbitClient:
         log.info("orbit_no_mr_data", file_path=file_path)
         return [], True
 
+    async def _find_mrs_via_diff_traversal(self, file_path: str, path_field: str) -> list[dict]:
+        """Find merged MRs that touched a file using current Orbit relationship syntax."""
+        nodes = await self._run_with_retry({
+            "query": {
+                "query_type": "traversal",
+                "nodes": [
+                    {
+                        "id": "project",
+                        "entity": "Project",
+                        "filters": {"full_path": self._config.project_path},
+                        "columns": ["id", "full_path"],
+                    },
+                    {
+                        "id": "mr",
+                        "entity": "MergeRequest",
+                        "filters": {"state": "merged"},
+                        "columns": [
+                            "id",
+                            "iid",
+                            "title",
+                            "description",
+                            "state",
+                            "merged_at",
+                            "source_branch",
+                            "target_branch",
+                        ],
+                    },
+                    {
+                        "id": "snapshot",
+                        "entity": "MergeRequestDiff",
+                        "columns": ["id"],
+                    },
+                    {
+                        "id": "file",
+                        "entity": "MergeRequestDiffFile",
+                        "filters": {path_field: file_path},
+                        "columns": ["old_path", "new_path"],
+                    },
+                ],
+                "relationships": [
+                    {"type": "IN_PROJECT", "from": "mr", "to": "project"},
+                    {"type": "HAS_DIFF", "from": "mr", "to": "snapshot"},
+                    {"type": "HAS_FILE", "from": "snapshot", "to": "file"},
+                ],
+                "limit": 25,
+            }
+        })
+        return _dedup_mrs(_filter_merged_mrs(nodes))
+
     async def _enrich_mr(self, mr_node: dict) -> MRContext:
         """Build MRContext from a flat Orbit MergeRequest node (single enrichment query)."""
         mr_iid = int(mr_node.get("iid", 0))
         merged_at = _parse_merged_at(mr_node.get("merged_at"))
+        needs_rest = not all(
+            _node_str(mr_node, key)
+            for key in ("title", "web_url", "author_username")
+        )
+        rest_mr = await self._get_merge_request_rest(mr_iid) if needs_rest else {}
 
         # One neighbors query returns WorkItem, User, and Pipeline nodes together
         neighbors = await self._get_neighbors("MergeRequest", {"iid": mr_iid})
         project_url = f"{self._config.gitlab_url}/{self._config.project_path}"
         linked, reviewers, pipeline_status = _extract_mr_enrichment(neighbors, project_url)
 
-        web_url = _node_str(mr_node, "web_url", "url")
+        web_url = _node_str(mr_node, "web_url", "url") or str(rest_mr.get("web_url", ""))
         if not web_url and mr_iid:
             web_url = (
                 f"{self._config.gitlab_url}/{self._config.project_path}"
                 f"/-/merge_requests/{mr_iid}"
             )
 
+        rest_author = rest_mr.get("author")
+        author_username = _node_str(mr_node, "author_username", "author")
+        if not author_username and isinstance(rest_author, dict):
+            author_username = str(rest_author.get("username", ""))
+
         return MRContext(
             iid=mr_iid,
-            title=_node_str(mr_node, "title"),
-            description=_node_str(mr_node, "description"),
-            author_username=_node_str(mr_node, "author_username", "author", default="unknown"),
+            title=_node_str(mr_node, "title") or str(rest_mr.get("title", "")),
+            description=_node_str(mr_node, "description") or str(rest_mr.get("description", "")),
+            author_username=author_username or "unknown",
             merged_at=merged_at,
             web_url=web_url,
             linked_issues=linked,
@@ -300,6 +381,28 @@ class OrbitClient:
             days_since_merge=_days_since(merged_at),
             pipeline_status=pipeline_status,
         )
+
+    async def _get_merge_request_rest(self, mr_iid: int) -> dict:
+        """Fetch REST MR fields that Orbit traversal can omit."""
+        if mr_iid <= 0:
+            return {}
+        try:
+            encoded_project = self._config.project_path.replace("/", "%2F")
+            response = await self._client.get(
+                f"/api/v4/projects/{encoded_project}/merge_requests/{mr_iid}"
+            )
+            if response.status_code != 200:
+                log.warning(
+                    "mr_rest_fetch_failed",
+                    mr_iid=mr_iid,
+                    status=response.status_code,
+                )
+                return {}
+            body = response.json()
+            return body if isinstance(body, dict) else {}
+        except httpx.HTTPError as exc:
+            log.warning("mr_rest_fetch_exception", mr_iid=mr_iid, exc=str(exc))
+            return {}
 
     async def _get_caller_count(self, function_name: str) -> int:
         try:
@@ -314,14 +417,47 @@ class OrbitClient:
 
     async def _get_security_findings(self, file_path: str) -> list[VulnerabilityFinding]:
         try:
-            nodes = await self._traverse("Vulnerability", {"file_path": file_path}, limit=3)
+            nodes = await self._run_with_retry({
+                "query": {
+                    "query_type": "traversal",
+                    "nodes": [
+                        {
+                            "id": "project",
+                            "entity": "Project",
+                            "filters": {"full_path": self._config.project_path},
+                            "columns": ["id", "full_path"],
+                        },
+                        {
+                            "id": "v",
+                            "entity": "Vulnerability",
+                            "filters": {
+                                "state": {"op": "in", "value": ["detected", "confirmed"]},
+                            },
+                            "columns": ["id", "title", "severity", "state", "report_type"],
+                        },
+                        {
+                            "id": "occ",
+                            "entity": "VulnerabilityOccurrence",
+                            "filters": {"location": {"op": "contains", "value": file_path}},
+                            "columns": ["id", "name", "location", "severity", "report_type"],
+                        },
+                    ],
+                    "relationships": [
+                        {"type": "IN_PROJECT", "from": "v", "to": "project"},
+                        {"type": "OCCURRENCE_OF", "from": "occ", "to": "v"},
+                    ],
+                    "limit": 3,
+                }
+            })
             findings: list[VulnerabilityFinding] = []
             for node in nodes:
+                if node.get("type") not in ("Vulnerability", "VulnerabilityOccurrence"):
+                    continue
                 state = _node_str(node, "state", default="detected")
                 if state not in ("detected", "confirmed"):
                     continue
                 findings.append(VulnerabilityFinding(
-                    name=_node_str(node, "name"),
+                    name=_node_str(node, "name", "title"),
                     severity=_node_str(node, "severity", default="unknown").lower(),
                     state=state,
                     report_type=_node_str(node, "report_type", default="unknown"),
@@ -468,9 +604,16 @@ class OrbitClient:
             )
             return []
 
-        # Orbit API contract: result is always a mapping when present.
-        # Use default {} so absent key and None both resolve to empty.
-        return body.get("result", {}).get("nodes", [])
+        result = body.get("result") or {}
+        if isinstance(result, dict):
+            nodes = result.get("nodes", [])
+            return nodes if isinstance(nodes, list) else []
+        if isinstance(result, list):
+            return [
+                row for row in result
+                if isinstance(row, dict) and row.get("type")
+            ]
+        return []
 
     @staticmethod
     def _orbit_miss(frame: StackFrame) -> SymbolHistory:
@@ -495,10 +638,12 @@ class OrbitClient:
                     retryable=False,
                 )
             data = resp.json()
-            status = data.get("status", "unknown")
-            if status != "healthy":
+            user_available = data.get("user", {}).get("available", False)
+            system = data.get("system") or {}
+            status = system.get("status", "unknown")
+            if not user_available or status != "healthy":
                 return Err(
-                    message=f"Orbit status is '{status}', expected 'healthy'",
+                    message=f"Orbit status is '{status}', user_available={user_available}",
                     code="orbit_unhealthy",
                     retryable=False,
                 )

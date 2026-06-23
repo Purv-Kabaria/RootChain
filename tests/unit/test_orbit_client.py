@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -15,7 +14,6 @@ from src.rootchain.orbit_client import (
     _days_since,
     _parse_merged_at,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -37,7 +35,28 @@ def _make_frame(func: str = "processPayment", path: str = "payments/processor.py
 def _orbit_entity(request: httpx.Request) -> str:
     """Extract the Orbit DSL entity from a POST /api/v4/orbit/query request."""
     body = json.loads(request.content)
-    return body.get("query", {}).get("node", {}).get("entity", "")
+    query = body.get("query", {})
+    entity = query.get("node", {}).get("entity", "")
+    if entity:
+        return entity
+    return ",".join(
+        str(node.get("entity", ""))
+        for node in query.get("nodes", [])
+        if node.get("entity")
+    )
+
+
+def _orbit_path_field(request: httpx.Request) -> str:
+    """Return which MergeRequestDiffFile path field a traversal request uses."""
+    body = json.loads(request.content)
+    for node in body.get("query", {}).get("nodes", []):
+        if node.get("entity") == "MergeRequestDiffFile":
+            filters = node.get("filters", {})
+            if "old_path" in filters:
+                return "old_path"
+            if "new_path" in filters:
+                return "new_path"
+    return ""
 
 
 def _vuln_nodes(findings: list[dict]) -> dict:  # type: ignore[type-arg]
@@ -84,6 +103,13 @@ def test_parse_merged_at_none():
 
 def test_parse_merged_at_invalid():
     assert _parse_merged_at("not-a-date") is None
+
+
+def test_parse_merged_at_space_separated_utc():
+    dt = _parse_merged_at("2026-06-22 19:45:49.546783")
+    assert dt is not None
+    assert dt.tzinfo is not None
+    assert dt.year == 2026
 
 
 def test_days_since_none():
@@ -158,6 +184,61 @@ async def test_get_symbol_histories_fallback_on_empty(
 
     assert not histories[0].orbit_miss
     assert len(histories[0].recent_mrs) > 0
+
+
+@pytest.mark.asyncio
+async def test_get_symbol_histories_current_diff_traversal_old_path(config, orbit_empty_fixture):
+    """Current Orbit lookup uses Project -> MR -> Diff -> DiffFile old_path traversal."""
+    frame = _make_frame(path="src/rootchain/orchestrator.py")
+    traversal_payload = {
+        "result": {
+            "nodes": [
+                {
+                    "type": "MergeRequest",
+                    "id": "498840448",
+                    "iid": "3",
+                    "title": "feat: add configurable analysis timeout to orchestrator pipeline",
+                    "state": "merged",
+                    "merged_at": "2026-06-22 19:45:49.546783",
+                },
+                {
+                    "type": "MergeRequestDiffFile",
+                    "id": "3239967325946421559",
+                    "old_path": "src/rootchain/orchestrator.py",
+                    "new_path": "",
+                },
+            ],
+            "edges": [],
+        }
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if _orbit_path_field(request) == "old_path":
+            return httpx.Response(200, json=traversal_payload)
+        return httpx.Response(200, json=orbit_empty_fixture)
+
+    with respx.mock(base_url="https://gitlab.example.com") as mock:
+        mock.post("/api/v4/orbit/query").mock(side_effect=_handler)
+        mock.get("/api/v4/projects/myorg%2Fmyapp/merge_requests/3").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "iid": 3,
+                    "title": "feat: add configurable analysis timeout to orchestrator pipeline",
+                    "web_url": "https://gitlab.example.com/myorg/myapp/-/merge_requests/3",
+                    "author": {"username": "alice"},
+                },
+            )
+        )
+
+        async with OrbitClient(config) as client:
+            histories = await client.get_symbol_histories([frame])
+
+    assert not histories[0].orbit_miss
+    assert histories[0].recent_mrs[0].iid == 3
+    assert histories[0].recent_mrs[0].author_username == "alice"
+    assert histories[0].recent_mrs[0].merged_at is not None
+    assert histories[0].recent_mrs[0].merged_at.tzinfo is not None
 
 
 @pytest.mark.asyncio
@@ -260,7 +341,10 @@ async def test_cache_reuses_result(config, orbit_full_fixture):
 async def test_check_health_healthy(config):
     with respx.mock(base_url="https://gitlab.example.com") as mock:
         mock.get("/api/v4/orbit/status").mock(
-            return_value=httpx.Response(200, json={"status": "healthy"})
+            return_value=httpx.Response(
+                200,
+                json={"user": {"available": True}, "system": {"status": "healthy"}},
+            )
         )
 
         async with OrbitClient(config) as client:
@@ -274,7 +358,10 @@ async def test_check_health_healthy(config):
 async def test_check_health_unhealthy(config):
     with respx.mock(base_url="https://gitlab.example.com") as mock:
         mock.get("/api/v4/orbit/status").mock(
-            return_value=httpx.Response(200, json={"status": "degraded"})
+            return_value=httpx.Response(
+                200,
+                json={"user": {"available": True}, "system": {"status": "degraded"}},
+            )
         )
 
         async with OrbitClient(config) as client:
@@ -323,7 +410,7 @@ async def test_get_security_findings_on_successful_orbit_query(
 
     def _handler(request: httpx.Request) -> httpx.Response:
         entity = _orbit_entity(request)
-        if entity == "Vulnerability":
+        if "Vulnerability" in entity:
             return httpx.Response(200, json=vuln_payload)
         if entity == "File":
             return httpx.Response(200, json=orbit_full_fixture)
@@ -350,7 +437,7 @@ async def test_get_security_findings_exception_returns_empty(
 
     def _handler(request: httpx.Request) -> httpx.Response:
         entity = _orbit_entity(request)
-        if entity == "Vulnerability":
+        if "Vulnerability" in entity:
             raise httpx.NetworkError("Orbit security domain unreachable")
         if entity == "File":
             return httpx.Response(200, json=orbit_full_fixture)

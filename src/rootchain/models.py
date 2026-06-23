@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
-from typing import Generic, Literal, TypeVar
+from enum import StrEnum
+from typing import Generic, Literal, TypeAlias, TypeVar
 
 from pydantic import BaseModel, ConfigDict
 
@@ -24,10 +24,10 @@ class Err:
     retryable: bool = False
 
 
-type Result[T] = Ok[T] | Err
+Result: TypeAlias = Ok[T] | Err
 
 
-class Language(str, Enum):
+class Language(StrEnum):
     PYTHON = "python"
     JAVASCRIPT = "javascript"
     GO = "go"

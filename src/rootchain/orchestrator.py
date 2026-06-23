@@ -22,6 +22,15 @@ from .sentry_parser import SentryParser
 log = structlog.get_logger()
 
 
+def _print_comment(comment: str) -> None:
+    """Write dry-run Markdown as UTF-8 even on Windows cp1252 consoles."""
+    try:
+        sys.stdout.buffer.write(comment.encode("utf-8"))
+        sys.stdout.buffer.write(b"\n")
+    except AttributeError:
+        print(comment)
+
+
 def _configure_logging(config: Config) -> None:
     import logging
 
@@ -75,19 +84,18 @@ async def run_analysis(
         bound_log.info("already_analyzed_skipping")
         return
 
-    async with GitLabClient(config) as gitlab:
-        async with OrbitClient(config) as orbit:
-            await _analyze(
-                project_path=project_path,
-                issue_iid=issue_iid,
-                issue_title=issue_title,
-                issue_description=issue_description,
-                config=config,
-                gitlab=gitlab,
-                orbit=orbit,
-                bound_log=bound_log,
-                dry_run=dry_run,
-            )
+    async with GitLabClient(config) as gitlab, OrbitClient(config) as orbit:
+        await _analyze(
+            project_path=project_path,
+            issue_iid=issue_iid,
+            issue_title=issue_title,
+            issue_description=issue_description,
+            config=config,
+            gitlab=gitlab,
+            orbit=orbit,
+            bound_log=bound_log,
+            dry_run=dry_run,
+        )
 
 
 async def _analyze(
@@ -109,7 +117,7 @@ async def _analyze(
         bound_log.warning("no_parseable_stack_trace")
         comment = format_no_stack_trace_comment(issue_title)
         if dry_run:
-            print(comment)
+            _print_comment(comment)
             return
         await _post_and_label(gitlab, project_path, issue_iid, comment, config, bound_log)
         return
@@ -120,7 +128,7 @@ async def _analyze(
         raw_count = issue_description.count("File \"")
         comment = format_all_library_frames_comment(raw_count)
         if dry_run:
-            print(comment)
+            _print_comment(comment)
             return
         await _post_and_label(gitlab, project_path, issue_iid, comment, config, bound_log)
         return
@@ -138,7 +146,7 @@ async def _analyze(
         )
         comment = format_all_library_frames_comment(len(event.frames))
         if dry_run:
-            print(comment)
+            _print_comment(comment)
             return
         await _post_and_label(gitlab, project_path, issue_iid, comment, config, bound_log)
         return
@@ -148,7 +156,7 @@ async def _analyze(
     comment = format_blame_comment(chain, event, config, project_path)
 
     if dry_run:
-        print(comment)
+        _print_comment(comment)
         bound_log.info("dry_run_complete", frames_analyzed=chain.frames_analyzed)
         return
 
@@ -182,8 +190,6 @@ async def _post_and_label(
 def main() -> None:
     """CLI entry point for standalone operation (not inside Duo flow)."""
     import argparse
-    import os
-
     try:
         from dotenv import load_dotenv
         load_dotenv()
