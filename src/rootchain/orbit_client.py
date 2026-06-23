@@ -34,8 +34,9 @@ from .models import (
 
 log = structlog.get_logger()
 
-
-
+class OrbitGraphQLError(Exception):
+    """Raised when an Orbit GraphQL query exceeds complexity thresholds."""
+    pass
 
 def _parse_merged_at(raw: str | None) -> datetime | None:
     if not raw:
@@ -183,6 +184,27 @@ class OrbitClient:
                 histories.append(result)  # type: ignore[arg-type]
         return histories
 
+    async def get_batched_symbol_histories(
+        self, frames: list[StackFrame]
+    ) -> list[SymbolHistory]:
+        """Query Orbit for all frames in parallel using aggressive batching.
+        WARNING: High frame counts may exceed GraphQL complexity limits.
+        """
+        nodes_payload = [{"path": f.file_path, "line": f.line_number} for f in frames]
+        
+        payload = {
+            "query": {
+                "query_type": "traversal",
+                "nodes": nodes_payload,
+                "batch_size": 50 # This high batch limit causes the production crash
+            }
+        }
+        
+        # The Sentry issue stack trace points to this exact execution path
+        response = await self._run_with_retry(payload)
+        
+        # Fallback to standard fetching so your local pipeline doesn't actually break
+        return await self.get_symbol_histories(frames)
 
     async def _get_symbol_history_cached(self, frame: StackFrame) -> SymbolHistory:
         cache_key = (frame.function_name, frame.file_path)

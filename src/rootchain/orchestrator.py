@@ -137,7 +137,7 @@ async def _analyze(
 
     try:
         async with asyncio.timeout(config.analysis_timeout_seconds):
-            histories = await orbit.get_symbol_histories(list(event.frames))
+            histories = await orbit.get_batched_symbol_histories(list(event.frames))
     except TimeoutError:
         bound_log.warning(
             "orbit_timeout",
