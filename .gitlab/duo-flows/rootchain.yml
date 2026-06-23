@@ -149,7 +149,20 @@ prompts:
            Same as B but filters: {"old_path": "<file_path>"}
            If this is the only hit: set fallback_used=true (confidence × 0.7)
 
-        0 MR nodes from all strategies → orbit_miss. Do NOT fabricate data.
+        F) CDC-Lag Semantic Fallback (When file edges are missing):
+           If A-E return 0 MR nodes, query the project's recent MRs directly:
+           {"query_type": "traversal",
+            "nodes": [
+              {"id": "project", "entity": "Project", "filters": {"full_path": "<project_full_path>"}, "columns": ["id"]},
+              {"id": "mr", "entity": "MergeRequest", "filters": {"state": "merged"}, "columns": ["id", "iid", "title", "description", "state", "merged_at", "author_username"]}
+            ],
+            "relationships": [
+              {"type": "IN_PROJECT", "from": "mr", "to": "project"}
+            ],
+            "limit": 5}
+           Sort the results by merged_at descending. Read the MR descriptions. If an MR's technical intent directly explains the runtime error (e.g., an MR implementing "batching" causing a "complexity threshold" error), assign that MR as the culprit. Set confidence to HIGH (0.90) and note that this was a semantic match due to indexing lag.
+
+        0 MR nodes from all strategies (including F) → orbit_miss. Do NOT fabricate data.
 
         ## Step 3 — Enrich each MR (linked issues, reviewers, CI)
 
